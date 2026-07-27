@@ -386,25 +386,36 @@ func (task *Task) postTaskAllocated() {
 }
 
 // beforeTaskAllocated is called before handling the TaskAllocated event.
-// This sets the allocation information returned by the core in the task.
-// In some cases, the task is canceled (e.g. pod deleted) before we process the allocation
-// from the core. Those task will already be in the Completed state.
-// If we find the task is already in Completed state while handling TaskAllocated
-// event, we need to explicitly release this allocation because it is no
-// longer valid.
-func (task *Task) beforeTaskAllocated(eventSrc string, allocationKey string, nodeID string) {
+// This sets the allocation information returned by the core in the task. It must
+// stay a before-hook: the enter-Allocated callback (postTaskAllocated) binds the
+// pod using these fields, so they must be set before the transition completes.
+// It only writes plain task fields and acquires no locks, so it is safe to run
+// while the FSM holds its internal locks across before-callbacks.
+func (task *Task) beforeTaskAllocated(allocationKey string, nodeID string) {
 	// task is allocated on a node with a allocationKey set the details in the task here to allow referencing later.
 	task.allocationKey = allocationKey
 	task.nodeName = nodeID
+}
+
+// afterTaskAllocated runs after the TaskAllocated event, once the FSM has
+// released its internal locks (see releaseAllocation for why the release must
+// not run in a before-callback).
+// In some cases, the task is canceled (e.g. pod deleted) before we process the
+// allocation from the core. Those tasks will already be in the Completed state.
+// If we find the task was already in Completed state while handling the
+// TaskAllocated event, we need to explicitly release this allocation because it
+// is no longer valid. eventSrc is the FSM event's source state, i.e. the task
+// state at the time the TaskAllocated event was evaluated.
+func (task *Task) afterTaskAllocated(eventSrc string) {
 	// If the task is Completed the pod was deleted on K8s but the core was not aware yet.
 	// Notify the core to release this allocation to avoid resource leak.
 	// The ask is not relevant at this point.
 	if eventSrc == TaskStates().Completed {
 		log.Log(log.ShimCacheTask).Info("task is already completed, invalidate the allocation",
 			zap.String("currentTaskState", eventSrc),
-			zap.String("allocationKey", allocationKey),
-			zap.String("allocatedNode", nodeID))
-		task.releaseAllocation(false)
+			zap.String("allocationKey", task.allocationKey),
+			zap.String("allocatedNode", task.nodeName))
+		task.releaseAllocation(eventSrc, false)
 	}
 }
 
@@ -429,21 +440,25 @@ func (task *Task) postTaskRejected() {
 		fmt.Sprintf("task %s failed because it is rejected by scheduler", task.alias)))
 }
 
-// beforeTaskFail releases the allocation or ask from scheduler core
-// this is done as a before hook because the releaseAllocation() call needs to
-// send different requests to scheduler-core, depending on current task state
-func (task *Task) beforeTaskFail() {
+// afterTaskFail releases the allocation or ask from scheduler core.
+// This was historically a before-hook so that releaseAllocation could read the
+// pre-transition state through GetTaskState() (YUNIKORN-45); it is now an
+// after-hook for lock safety (see releaseAllocation) and the pre-transition
+// state is passed in explicitly as the FSM event's source state, which is
+// exactly what GetTaskState() returned while the before-hook ran.
+func (task *Task) afterTaskFail(eventSrc string) {
 	events.GetRecorder().Eventf(task.pod.DeepCopy(), nil,
 		v1.EventTypeNormal, "TaskFailed", "TaskFailed",
 		"Task %s is failed", task.alias)
-	task.releaseAllocation(false)
+	task.releaseAllocation(eventSrc, false)
 }
 
-// beforeTaskCompleted releases the allocation or ask from scheduler core
-// this is done as a before hook because the releaseAllocation() call needs to
-// send different requests to scheduler-core, depending on current task state
-func (task *Task) beforeTaskCompleted() {
-	task.releaseAllocation(false)
+// afterTaskCompleted releases the allocation or ask from scheduler core.
+// This is an after-hook for the same reasons as afterTaskFail: the release must
+// run outside the FSM's internal locks (see releaseAllocation), and the
+// pre-transition state it needs is passed in as the FSM event's source state.
+func (task *Task) afterTaskCompleted(eventSrc string) {
+	task.releaseAllocation(eventSrc, false)
 
 	events.GetRecorder().Eventf(task.pod.DeepCopy(), nil,
 		v1.EventTypeNormal, "TaskCompleted", "TaskCompleted",
@@ -451,7 +466,31 @@ func (task *Task) beforeTaskCompleted() {
 }
 
 // releaseAllocation sends the release request for the Allocation to the core.
-func (task *Task) releaseAllocation(force bool) {
+//
+// currentState is the task state the release is evaluated against. Callers in
+// task FSM after-callbacks pass the event's source state (identical to what
+// GetTaskState() returned before the transition, preserving the semantics of
+// the historical before-hook, see YUNIKORN-45); callers outside FSM callbacks
+// (e.g. flushReleaseableTasks) pass task.GetTaskState().
+//
+// Lock safety: this runs with the task lock held (task.handle) and must be
+// lock-neutral beyond that:
+//   - It must NOT run inside a task FSM before-callback: the FSM holds its
+//     internal state lock (read-locked) across before-callbacks, so re-reading
+//     the state here via GetTaskState() is a recursive read-lock that deadlocks
+//     behind a queued FSM writer (e.g. MarkPreviouslyAllocated -> SetState),
+//     and any other lock acquired here would nest inside the FSM lock window.
+//     It is therefore only invoked from after-callbacks, where the FSM has
+//     already released its internal locks, and it reads the state exclusively
+//     through the currentState argument.
+//   - It must NOT drop and re-take the task lock: another goroutine (e.g. the
+//     scheduling loop calling task.handle) can grab the freed task lock and
+//     block inside the FSM, after which re-acquiring the task lock deadlocks.
+//   - It must NOT acquire the application lock: application FSM callbacks run
+//     while the application lock is held and acquire task locks, the opposite
+//     order. Deferral bookkeeping uses the dedicated leaf lock
+//     releaseableTasksLock instead (see Application.tryAddReleasableTask).
+func (task *Task) releaseAllocation(currentState string, force bool) {
 	terminationType := common.GetTerminationTypeFromString(task.terminationType)
 
 	if !force && task.shouldAppRelease() {
@@ -467,7 +506,7 @@ func (task *Task) releaseAllocation(force bool) {
 			zap.String("taskID", task.taskID),
 			zap.String("taskAlias", task.alias),
 			zap.String("allocationKey", task.allocationKey),
-			zap.String("task", task.GetTaskState()),
+			zap.String("task", currentState),
 			zap.String("terminationType", string(terminationType)))
 
 		// send an AllocationReleaseRequest
@@ -475,15 +514,15 @@ func (task *Task) releaseAllocation(force bool) {
 		s := TaskStates()
 
 		// check if the task is in a state where it has not been allocated yet
-		if task.GetTaskState() != s.New && task.GetTaskState() != s.Pending &&
-			task.GetTaskState() != s.Scheduling && task.GetTaskState() != s.Rejected {
+		if currentState != s.New && currentState != s.Pending &&
+			currentState != s.Scheduling && currentState != s.Rejected {
 			// task is in a state where it might have been allocated
 			if task.allocationKey == "" {
 				log.Log(log.ShimCacheTask).Warn("BUG: task allocationKey is empty on release",
 					zap.String("applicationID", task.applicationID),
 					zap.String("taskID", task.taskID),
 					zap.String("taskAlias", task.alias),
-					zap.String("taskState", task.GetTaskState()))
+					zap.String("taskState", currentState))
 			}
 		}
 
@@ -505,9 +544,12 @@ func (task *Task) releaseAllocation(force bool) {
 	}
 }
 
+// shouldAppRelease reports whether the release of this task is deferred until
+// the application is accepted by the core (YUNIKORN-3089). It is called from
+// the task-release path with the task lock held (see releaseAllocation); it
+// must not drop the task lock and must not acquire the application lock
+// (tryAddReleasableTask uses a dedicated leaf lock instead).
 func (task *Task) shouldAppRelease() bool {
-	task.lock.Unlock()
-	defer task.lock.Lock()
 	return task.application.tryAddReleasableTask(task)
 }
 

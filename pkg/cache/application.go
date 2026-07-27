@@ -60,6 +60,7 @@ type Application struct {
 	schedulingStyle            string
 	originatingTask            *Task // Original Pod which creates the requests
 	releaseableTasks           []*Task
+	releaseableTasksLock       locking.Mutex // guards releaseableTasks only; leaf lock, see tryAddReleasableTask
 	context                    *Context
 }
 
@@ -700,9 +701,30 @@ func (app *Application) removeCompletedTasks() {
 	}
 }
 
+// tryAddReleasableTask defers the release of a task while the application has
+// not been accepted by the core yet (YUNIKORN-3089, see flushReleaseableTasks).
+// Returns true if the release is deferred, false if the caller must send the
+// release itself.
+//
+// Locking: this is called from the task-release path, which runs inside task
+// FSM after-callbacks with the task lock held (see Task.releaseAllocation). It
+// therefore MUST NOT acquire the application lock: application FSM callbacks
+// run while the application lock is held and may acquire task locks (e.g.
+// handleReleaseAppAllocationEvent -> setTaskTerminationType), so taking the
+// application lock here would invert the established application-lock ->
+// task-lock order. The dedicated leaf lock releaseableTasksLock only ever
+// guards the releaseableTasks slice, and the application state is read through
+// the application FSM's own internal lock via sm.Current().
+//
+// Atomicity with flushReleaseableTasks: the FSM sets the state to Accepted
+// before the enter-state callback runs flushReleaseableTasks. If this function
+// observes New or Submitted under releaseableTasksLock, the flush drain has not
+// happened yet, so the appended task is guaranteed to be picked up by the
+// flush. If it observes any later state, the caller releases directly. Either
+// way the release cannot be lost.
 func (app *Application) tryAddReleasableTask(task *Task) bool {
-	app.lock.Lock()
-	defer app.lock.Unlock()
+	app.releaseableTasksLock.Lock()
+	defer app.releaseableTasksLock.Unlock()
 
 	current := app.sm.Current()
 	if current == ApplicationStates().New ||
@@ -720,17 +742,23 @@ func (app *Application) tryAddReleasableTask(task *Task) bool {
 }
 
 func (app *Application) clearReleaseableTasks() {
+	app.releaseableTasksLock.Lock()
+	defer app.releaseableTasksLock.Unlock()
 	app.releaseableTasks = nil
 }
 
 // flushReleaseableTasks replays deferred task releases after the application has been accepted
-// by the scheduler core. Must be called while the application lock is held.
+// by the scheduler core. Must be called while the application lock is held (it reads the task
+// map); the releaseableTasks slice itself is guarded by releaseableTasksLock.
 func (app *Application) flushReleaseableTasks() {
-	if len(app.releaseableTasks) == 0 {
-		return
-	}
+	app.releaseableTasksLock.Lock()
 	tasks := app.releaseableTasks
 	app.releaseableTasks = nil
+	app.releaseableTasksLock.Unlock()
+
+	if len(tasks) == 0 {
+		return
+	}
 
 	if app.AreAllTasksTerminated() {
 		app.removeFromSchedulerCore()
@@ -741,7 +769,9 @@ func (app *Application) flushReleaseableTasks() {
 	}
 
 	for _, task := range tasks {
-		task.releaseAllocation(true)
+		// Not inside a task FSM callback here, so the FSM's internal locks are
+		// not held; reading the live state via GetTaskState() is safe and correct.
+		task.releaseAllocation(task.GetTaskState(), true)
 	}
 }
 
