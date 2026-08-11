@@ -41,34 +41,50 @@ import (
 )
 
 type Application struct {
-	applicationID              string
-	queue                      string
-	partition                  string
-	user                       string
-	groups                     []string
-	taskMap                    map[string]*Task
-	tags                       map[string]string
-	taskGroups                 []TaskGroup
-	taskGroupsDefinition       string
+	applicationID string
+	queue         string
+	partition     string
+	user          string
+	groups        []string
+	// +checklocks:lock
+	taskMap map[string]*Task
+	tags    map[string]string
+	// +checklocks:lock
+	taskGroups []TaskGroup
+	// +checklocks:lock
+	taskGroupsDefinition string
+	// +checklocks:lock
 	schedulingParamsDefinition string
+	// +checklocks:lock
 	placeholderOwnerReferences []metav1.OwnerReference
 	sm                         *fsm.FSM
 	lock                       *locking.RWMutex
 	schedulerAPI               api.SchedulerAPI
-	placeholderAsk             *si.Resource // total placeholder request for the app (all task groups)
-	placeholderTimeoutInSec    int64
-	schedulingStyle            string
-	originatingTask            *Task // Original Pod which creates the requests
-	releaseableTasks           []*Task
-	context                    *Context
+	// +checklocks:lock
+	placeholderAsk *si.Resource // total placeholder request for the app (all task groups)
+	// +checklocks:lock
+	placeholderTimeoutInSec int64
+	// +checklocks:lock
+	schedulingStyle string
+	// +checklocks:lock
+	originatingTask *Task // Original Pod which creates the requests
+	// +checklocks:lock
+	releaseableTasks []*Task
+	context          *Context
 }
 
 const transitionErr = "no transition"
 
+// String must never take the application lock: it is used as a lazily evaluated zap field
+// and is evaluated while the write lock is held, handleSubmitApplicationEvent logs the
+// application while running under handle(). Taking the read lock here deadlocks the
+// submission path.
+// YUNIKORN-XXXX: that leaves taskMap read without the lock while other threads can add or
+// remove tasks. The fix is a snapshot taken by the caller, not a lock in this method.
 func (app *Application) String() string {
 	return fmt.Sprintf("applicationID: %s, queue: %s, partition: %s,"+
 		" totalNumOfTasks: %d, currentState: %s",
-		app.applicationID, app.queue, app.partition, len(app.taskMap), app.GetApplicationState())
+		app.applicationID, app.queue, app.partition, len(app.taskMap), app.GetApplicationState()) // +checklocksignore
 }
 
 func NewApplication(appID, queueName, user string, groups []string, tags map[string]string, scheduler api.SchedulerAPI) *Application {
@@ -237,6 +253,7 @@ func (app *Application) RemoveTask(taskID string) {
 	app.removeTask(taskID)
 }
 
+// +checklocks:app.lock
 func (app *Application) removeTask(taskID string) {
 	if _, ok := app.taskMap[taskID]; !ok {
 		log.Log(log.ShimCacheApplication).Debug("Attempted to remove non-existent task", zap.String("taskID", taskID))
@@ -282,6 +299,7 @@ func (app *Application) GetPlaceHolderTasks() []*Task {
 	return app.getPlaceHolderTasks()
 }
 
+// +checklocksread:app.lock
 func (app *Application) getPlaceHolderTasks() []*Task {
 	placeholders := make([]*Task, 0)
 	for _, task := range app.taskMap {
@@ -293,6 +311,7 @@ func (app *Application) getPlaceHolderTasks() []*Task {
 	return placeholders
 }
 
+// +checklocksread:app.lock
 func (app *Application) getTasks(state string) []*Task {
 	taskList := make([]*Task, 0)
 	if len(app.taskMap) > 0 {
@@ -317,6 +336,7 @@ func (app *Application) GetTags() map[string]string {
 	return app.tags
 }
 
+// +checklocksread:app.lock
 func (app *Application) getNonTerminatedTaskAlias() []string {
 	var nonTerminatedTaskAlias []string
 	for _, task := range app.taskMap {
@@ -327,6 +347,10 @@ func (app *Application) getNonTerminatedTaskAlias() []string {
 	return nonTerminatedTaskAlias
 }
 
+// YUNIKORN-XXXX: the task map is walked without the application lock when called from
+// outside the cache (shim/scheduler.go), while flushReleaseableTasks calls it with the lock
+// held: split into a locked and an unlocked variant.
+// +checklocksignore
 func (app *Application) AreAllTasksTerminated() bool {
 	return len(app.getNonTerminatedTaskAlias()) == 0
 }
@@ -400,7 +424,8 @@ func (app *Application) scheduleTasks(taskScheduleCondition func(t *Task) bool) 
 			// for each new task, we do a sanity check before moving the state to Pending_Schedule
 			if err := task.sanityCheckBeforeScheduling(); err == nil {
 				// check inconsistent pod metadata before submitting the task
-				task.checkPodMetadataBeforeScheduling()
+				// YUNIKORN-XXXX: the task pod is read without the task lock held.
+				task.checkPodMetadataBeforeScheduling() // +checklocksignore
 
 				// note, if we directly trigger submit task event, it may spawn too many duplicate
 				// events, because a task might be submitted multiple times before its state transits to PENDING.
@@ -422,6 +447,7 @@ func (app *Application) scheduleTasks(taskScheduleCondition func(t *Task) bool) 
 	}
 }
 
+// +checklocks:app.lock
 func (app *Application) handleSubmitApplicationEvent() error {
 	log.Log(log.ShimCacheApplication).Info("handle app submission",
 		zap.Stringer("app", app),
@@ -454,6 +480,7 @@ func (app *Application) handleSubmitApplicationEvent() error {
 	return nil
 }
 
+// +checklocksread:app.lock
 func (app *Application) skipReservationStage() bool {
 	// no task groups defined, skip reservation
 	if len(app.taskGroups) == 0 {
@@ -479,6 +506,10 @@ func (app *Application) skipReservationStage() bool {
 	return false
 }
 
+// YUNIKORN-XXXX: reads taskGroups and (via skipReservationStage) taskMap without the
+// application lock, Schedule calls this outside of the state machine transition: take the
+// read lock or make it a callback like the other state handlers.
+// +checklocksignore
 func (app *Application) postAppAccepted() {
 	// if app has taskGroups defined, and it has no allocated tasks,
 	// it goes to the Reserving state before getting to Running.
@@ -503,6 +534,7 @@ func (app *Application) postAppAccepted() {
 
 // onResuming triggered when entering the resuming state which is triggered by the time out of the gang placeholders
 // if SOFT gang scheduling is configured.
+// +checklocks:app.lock
 func (app *Application) onResuming() {
 	if app.originatingTask != nil {
 		events.GetRecorder().Eventf(app.originatingTask.GetTaskPod().DeepCopy(), nil, v1.EventTypeWarning, "GangScheduling",
@@ -513,6 +545,7 @@ func (app *Application) onResuming() {
 // onReserving triggered when entering the reserving state.
 // During normal operation this creates all the placeholders. During recovery this call could cause the application
 // in the shim and core to progress to the next state.
+// +checklocks:app.lock
 func (app *Application) onReserving() {
 	// if any placeholder already exist during recovery we might need to send
 	// an event to trigger Application state change in the core
@@ -534,8 +567,10 @@ func (app *Application) onReserving() {
 			ev := NewRunApplicationEvent(app.applicationID)
 			dispatcher.Dispatch(ev)
 			// failed at least one placeholder creation progress as a normal application
-			if app.originatingTask != nil {
-				events.GetRecorder().Eventf(app.originatingTask.GetTaskPod().DeepCopy(), nil, v1.EventTypeWarning, "GangScheduling",
+			// YUNIKORN-XXXX: this runs in its own go routine, the application lock of the
+			// caller is long gone by the time originatingTask is read here.
+			if app.originatingTask != nil { // +checklocksignore
+				events.GetRecorder().Eventf(app.originatingTask.GetTaskPod().DeepCopy(), nil, v1.EventTypeWarning, "GangScheduling", // +checklocksignore
 					"PlaceholderCreateFailed", "Application %s fall back to normal scheduling", app.applicationID)
 			}
 		}
@@ -544,6 +579,7 @@ func (app *Application) onReserving() {
 
 // onReservationStateChange is called when there is an add or a release of a placeholder
 // If we have all the required placeholders progress the application status, otherwise nothing happens
+// +checklocks:app.lock
 func (app *Application) onReservationStateChange() {
 	if app.originatingTask != nil {
 		events.GetRecorder().Eventf(app.originatingTask.GetTaskPod().DeepCopy(), nil, v1.EventTypeNormal, "GangScheduling",
@@ -583,6 +619,7 @@ func (app *Application) onReservationStateChange() {
 	dispatcher.Dispatch(NewRunApplicationEvent(app.applicationID))
 }
 
+// +checklocks:app.lock
 func (app *Application) handleRejectApplicationEvent(reason string) {
 	log.Log(log.ShimCacheApplication).Info("app is rejected by scheduler", zap.String("appID", app.applicationID))
 	app.clearReleaseableTasks()
@@ -613,6 +650,7 @@ func failTaskPodWithReasonAndMsg(task *Task, reason string, msg string) {
 	}
 }
 
+// +checklocks:app.lock
 func (app *Application) handleFailApplicationEvent(errMsg string) {
 	go func() {
 		getPlaceholderManager().cleanUp(app)
@@ -640,6 +678,7 @@ func (app *Application) handleFailApplicationEvent(errMsg string) {
 	}
 }
 
+// +checklocks:app.lock
 func (app *Application) handleReleaseAppAllocationEvent(taskID string, terminationType string) {
 	log.Log(log.ShimCacheApplication).Info("try to release pod from application",
 		zap.String("appID", app.applicationID),
@@ -660,6 +699,7 @@ func (app *Application) handleReleaseAppAllocationEvent(taskID string, terminati
 	}
 }
 
+// +checklocks:app.lock
 func (app *Application) handleAppTaskCompletedEvent() {
 	for _, task := range app.taskMap {
 		if task.placeholder && task.GetTaskState() != TaskStates().Completed {
@@ -671,6 +711,7 @@ func (app *Application) handleAppTaskCompletedEvent() {
 	dispatcher.Dispatch(NewRunApplicationEvent(app.applicationID))
 }
 
+// +checklocks:app.lock
 func (app *Application) publishPlaceholderTimeoutEvents(task *Task) {
 	taskTerminationType := task.GetTaskTerminationType()
 	if app.originatingTask != nil && task.IsPlaceholder() && taskTerminationType == si.TerminationType_name[int32(si.TerminationType_TIMEOUT)] {
@@ -719,12 +760,14 @@ func (app *Application) tryAddReleasableTask(task *Task) bool {
 	return false
 }
 
+// +checklocks:app.lock
 func (app *Application) clearReleaseableTasks() {
 	app.releaseableTasks = nil
 }
 
 // flushReleaseableTasks replays deferred task releases after the application has been accepted
 // by the scheduler core. Must be called while the application lock is held.
+// +checklocks:app.lock
 func (app *Application) flushReleaseableTasks() {
 	if len(app.releaseableTasks) == 0 {
 		return
@@ -735,13 +778,17 @@ func (app *Application) flushReleaseableTasks() {
 	if app.AreAllTasksTerminated() {
 		app.removeFromSchedulerCore()
 		if app.context != nil {
-			app.context.removeApplication(app.applicationID)
+			// YUNIKORN-XXXX: the application map of the context is updated without the
+			// context lock held, only the application lock is held here.
+			app.context.removeApplication(app.applicationID) // +checklocksignore
 		}
 		return
 	}
 
 	for _, task := range tasks {
-		task.releaseAllocation(true)
+		// YUNIKORN-XXXX: the task fields are read without the task lock held, only the
+		// application lock is held here.
+		task.releaseAllocation(true) // +checklocksignore
 	}
 }
 

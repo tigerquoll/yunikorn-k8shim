@@ -41,20 +41,30 @@ import (
 // Nodes are cached in the form of de-scheduler nodeInfo. Instead of re-creating all nodes info from scratch,
 // we replicate nodes info from de-scheduler, in order to re-use predicates functions.
 type SchedulerCache struct {
-	nodesMap     map[string]*framework.NodeInfo // node name to NodeInfo map
-	podsMap      map[string]*v1.Pod
-	pcMap        map[string]*schedulingv1.PriorityClass
-	assignedPods map[string]string  // map of pods to the node they are currently assigned to
-	assumedPods  map[string]bool    // map of assumed pods, value indicates if pod volumes are all bound
+	// +checklocks:lock
+	nodesMap map[string]*framework.NodeInfo // node name to NodeInfo map
+	// +checklocks:lock
+	podsMap map[string]*v1.Pod
+	// +checklocks:lock
+	pcMap map[string]*schedulingv1.PriorityClass
+	// +checklocks:lock
+	assignedPods map[string]string // map of pods to the node they are currently assigned to
+	// +checklocks:lock
+	assumedPods map[string]bool // map of assumed pods, value indicates if pod volumes are all bound
+	// +checklocks:lock
 	orphanedPods map[string]*v1.Pod // map of orphaned pods, keyed by pod UID
+	// +checklocks:lock
 	pvcRefCounts map[string]map[string]int
 	lock         locking.RWMutex
 	clients      *client.Clients // client APIs
 	klogger      klog.Logger
 
 	// cached data, re-calculated on demand from nodesMap
-	nodesInfo                        []fwk.NodeInfo
-	nodesInfoPodsWithAffinity        []fwk.NodeInfo
+	// +checklocks:lock
+	nodesInfo []fwk.NodeInfo
+	// +checklocks:lock
+	nodesInfoPodsWithAffinity []fwk.NodeInfo
+	// +checklocks:lock
 	nodesInfoPodsWithReqAntiAffinity []fwk.NodeInfo
 }
 
@@ -75,19 +85,23 @@ func NewSchedulerCache(clients *client.Clients) *SchedulerCache {
 
 // GetNodesInfoMap returns a reference to the internal node map. This is explicitly for the use of the predicate
 // shared lister and requires that the scheduler cache lock be held while accessing.
+// +checklocksread:cache.lock
 func (cache *SchedulerCache) GetNodesInfoMap() map[string]*framework.NodeInfo {
 	return cache.nodesMap
 }
 
 // GetNodesInfo returns a (possibly cached) list of nodes. This is explicitly for the use of the predicate
 // shared lister and requires that the scheduler cache lock be held while accessing.
+// +checklocksread:cache.lock
 func (cache *SchedulerCache) GetNodesInfo() []fwk.NodeInfo {
 	if cache.nodesInfo == nil {
 		nodeList := make([]fwk.NodeInfo, 0, len(cache.nodesMap))
 		for _, node := range cache.nodesMap {
 			nodeList = append(nodeList, node)
 		}
-		cache.nodesInfo = nodeList
+		// YUNIKORN-XXXX: the cached list is written while only the read lock is held
+		// (the predicate shared lister calls this via LockForReads).
+		cache.nodesInfo = nodeList // +checklocksignore
 	}
 
 	return cache.nodesInfo
@@ -96,6 +110,7 @@ func (cache *SchedulerCache) GetNodesInfo() []fwk.NodeInfo {
 // GetNodesInfoPodsWithAffinity returns a (possibly cached) list of nodes which contain pods with affinity.
 // This is explicitly for the use of the predicate shared lister and requires that the scheduler cache lock
 // be held while accessing.
+// +checklocksread:cache.lock
 func (cache *SchedulerCache) GetNodesInfoPodsWithAffinity() []fwk.NodeInfo {
 	if cache.nodesInfoPodsWithAffinity == nil {
 		nodeList := make([]fwk.NodeInfo, 0, len(cache.nodesMap))
@@ -104,7 +119,9 @@ func (cache *SchedulerCache) GetNodesInfoPodsWithAffinity() []fwk.NodeInfo {
 				nodeList = append(nodeList, node)
 			}
 		}
-		cache.nodesInfoPodsWithAffinity = nodeList
+		// YUNIKORN-XXXX: the cached list is written while only the read lock is held
+		// (the predicate shared lister calls this via LockForReads).
+		cache.nodesInfoPodsWithAffinity = nodeList // +checklocksignore
 	}
 
 	return cache.nodesInfoPodsWithAffinity
@@ -113,6 +130,7 @@ func (cache *SchedulerCache) GetNodesInfoPodsWithAffinity() []fwk.NodeInfo {
 // GetNodesInfoPodsWithReqAntiAffinity returns a (possibly cached) list of nodes which contain pods with required anti-affinity.
 // This is explicitly for the use of the predicate shared lister and requires that the scheduler cache lock
 // be held while accessing.
+// +checklocksread:cache.lock
 func (cache *SchedulerCache) GetNodesInfoPodsWithReqAntiAffinity() []fwk.NodeInfo {
 	if cache.nodesInfoPodsWithReqAntiAffinity == nil {
 		nodeList := make([]fwk.NodeInfo, 0, len(cache.nodesMap))
@@ -121,16 +139,20 @@ func (cache *SchedulerCache) GetNodesInfoPodsWithReqAntiAffinity() []fwk.NodeInf
 				nodeList = append(nodeList, node)
 			}
 		}
-		cache.nodesInfoPodsWithReqAntiAffinity = nodeList
+		// YUNIKORN-XXXX: the cached list is written while only the read lock is held
+		// (the predicate shared lister calls this via LockForReads).
+		cache.nodesInfoPodsWithReqAntiAffinity = nodeList // +checklocksignore
 	}
 
 	return cache.nodesInfoPodsWithReqAntiAffinity
 }
 
+// +checklocksacquireread:cache.lock
 func (cache *SchedulerCache) LockForReads() {
 	cache.lock.RLock()
 }
 
+// +checklocksreleaseread:cache.lock
 func (cache *SchedulerCache) UnlockForReads() {
 	cache.lock.RUnlock()
 }
@@ -153,6 +175,7 @@ func (cache *SchedulerCache) UpdateNode(node *v1.Node) (*v1.Node, []*v1.Pod) {
 	return cache.updateNode(node)
 }
 
+// +checklocks:cache.lock
 func (cache *SchedulerCache) updateNode(node *v1.Node) (*v1.Node, []*v1.Pod) {
 	var prevNode *v1.Node
 	adopted := make([]*v1.Pod, 0)
@@ -195,6 +218,7 @@ func (cache *SchedulerCache) RemoveNode(node *v1.Node) (*v1.Node, []*v1.Pod) {
 	return cache.removeNode(node)
 }
 
+// +checklocks:cache.lock
 func (cache *SchedulerCache) removeNode(node *v1.Node) (*v1.Node, []*v1.Pod) {
 	orphans := make([]*v1.Pod, 0)
 	nodeInfo, ok := cache.nodesMap[node.Name]
@@ -242,6 +266,7 @@ func (cache *SchedulerCache) UpdatePriorityClass(priorityClass *schedulingv1.Pri
 	cache.updatePriorityClass(priorityClass)
 }
 
+// +checklocks:cache.lock
 func (cache *SchedulerCache) updatePriorityClass(priorityClass *schedulingv1.PriorityClass) {
 	_, ok := cache.pcMap[priorityClass.Name]
 	if !ok {
@@ -261,6 +286,7 @@ func (cache *SchedulerCache) RemovePriorityClass(priorityClass *schedulingv1.Pri
 	cache.removePriorityClass(priorityClass)
 }
 
+// +checklocks:cache.lock
 func (cache *SchedulerCache) removePriorityClass(priorityClass *schedulingv1.PriorityClass) {
 	log.Log(log.ShimCacheExternal).Debug("Removing priorityClass from cache", zap.String("name", priorityClass.Name))
 	delete(cache.pcMap, priorityClass.Name)
@@ -273,6 +299,7 @@ func (cache *SchedulerCache) IsAssumedPod(podKey string) bool {
 	return cache.isAssumedPod(podKey)
 }
 
+// +checklocksread:cache.lock
 func (cache *SchedulerCache) isAssumedPod(podKey string) bool {
 	_, ok := cache.assumedPods[podKey]
 	return ok
@@ -293,6 +320,7 @@ func (cache *SchedulerCache) UpdatePod(newPod *v1.Pod) bool {
 	return cache.updatePod(newPod)
 }
 
+// +checklocks:cache.lock
 func (cache *SchedulerCache) updatePod(pod *v1.Pod) bool {
 	key := string(pod.UID)
 	result := true
@@ -381,6 +409,7 @@ func (cache *SchedulerCache) RemovePod(pod *v1.Pod) {
 	cache.removePod(pod)
 }
 
+// +checklocks:cache.lock
 func (cache *SchedulerCache) removePod(pod *v1.Pod) {
 	key := string(pod.UID)
 	log.Log(log.ShimCacheExternal).Debug("Removing deleted pod from cache", zap.String("podName", pod.Name), zap.String("podKey", key))
@@ -418,6 +447,7 @@ func (cache *SchedulerCache) IsPodOrphaned(uid string) bool {
 	return ok
 }
 
+// +checklocksread:cache.lock
 func (cache *SchedulerCache) GetPodNoLock(uid string) *v1.Pod {
 	if pod, ok := cache.podsMap[uid]; ok {
 		return pod
@@ -433,6 +463,7 @@ func (cache *SchedulerCache) AssumePod(pod *v1.Pod, allBound bool) {
 	cache.assumePod(pod, allBound)
 }
 
+// +checklocks:cache.lock
 func (cache *SchedulerCache) assumePod(pod *v1.Pod, allBound bool) {
 	key := string(pod.UID)
 
@@ -454,6 +485,7 @@ func (cache *SchedulerCache) ForgetPod(pod *v1.Pod) {
 	cache.forgetPod(pod)
 }
 
+// +checklocks:cache.lock
 func (cache *SchedulerCache) forgetPod(pod *v1.Pod) {
 	key := string(pod.UID)
 
@@ -515,6 +547,7 @@ func (cache *SchedulerCache) GetPersistentVolumeInfo(name string) (*v1.Persisten
 }
 
 // dumpState dumps summary statistics for the cache. Must be called with lock already acquired
+// +checklocksread:cache.lock
 func (cache *SchedulerCache) dumpState(context string) {
 	if log.Log(log.ShimCacheExternal).Core().Enabled(zapcore.DebugLevel) {
 		log.Log(log.ShimCacheExternal).Debug("Scheduler cache state ("+context+")",
@@ -526,6 +559,7 @@ func (cache *SchedulerCache) dumpState(context string) {
 	}
 }
 
+// +checklocksread:cache.lock
 func (cache *SchedulerCache) podPhases() map[string]int {
 	result := make(map[string]int)
 
@@ -541,6 +575,7 @@ func (cache *SchedulerCache) podPhases() map[string]int {
 	return result
 }
 
+// +checklocksread:cache.lock
 func (cache *SchedulerCache) nodePodCount() int {
 	result := 0
 	for _, node := range cache.nodesMap {
@@ -551,11 +586,13 @@ func (cache *SchedulerCache) nodePodCount() int {
 
 // IsPVCUsedByPods determines if a given volume claim is in use by any current pods. This is explicitly for the use
 // of the predicate shared lister and requires that the scheduler cache lock be held while accessing.
+// +checklocksread:cache.lock
 func (cache *SchedulerCache) IsPVCUsedByPods(key string) bool {
 	_, ok := cache.pvcRefCounts[key]
 	return ok
 }
 
+// +checklocks:cache.lock
 func (cache *SchedulerCache) updatePVCRefCounts(node *framework.NodeInfo, removeNode bool) {
 	nodeName := node.Node().Name
 	for k, v := range cache.pvcRefCounts {

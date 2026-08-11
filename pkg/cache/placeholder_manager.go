@@ -38,6 +38,7 @@ type PlaceholderManager struct {
 	// when the placeholder manager is unable to delete a pod,
 	// this pod becomes to be an "orphan" pod. We add them to a map
 	// and keep retrying deleting them in order to avoid wasting resources.
+	// +checklocks:RWMutex
 	orphanPods  map[string]*v1.Pod
 	stopChan    chan struct{}
 	running     atomic.Bool
@@ -75,7 +76,9 @@ func (mgr *PlaceholderManager) createAppPlaceholders(app *Application) error {
 
 	// map task group to count of already created placeholders
 	tgCounts := make(map[string]int32)
-	for _, ph := range app.getPlaceHolderTasks() {
+	// YUNIKORN-XXXX: the task map of the application is walked without the application
+	// lock held, only the placeholder manager lock is held here.
+	for _, ph := range app.getPlaceHolderTasks() { // +checklocksignore
 		tgCounts[ph.GetTaskGroupName()]++
 	}
 
