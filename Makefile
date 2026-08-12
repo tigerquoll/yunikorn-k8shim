@@ -375,6 +375,8 @@ lint: $(GOLANGCI_LINT_BIN)
 # only produces suggestions, and those are unstable and cannot always be acted upon.
 # The run starts with a self test on a fixture that must be reported, see the canary file
 # in pkg/locking: an analysis that reports nothing at all would pass this target silently.
+# The self test covers one violation of each annotation class in use, a guarded field and a
+# lock precondition, both must show up in its output.
 CHECKLOCKS_PACKAGES := $(REPO)/locking/... $(REPO)/cache/...
 checklocks: $(CHECKLOCKS_BIN)
 	@$(checklocks_check_toolchain)
@@ -383,8 +385,10 @@ checklocks: $(CHECKLOCKS_BIN)
 	canary=$$("$(GO)" list -f '{{.Dir}}' $(REPO)/locking)/$(CHECKLOCKS_CANARY) ; \
 	out=$$("$(GO)" vet "-vettool=$(BASE_DIR)/$(CHECKLOCKS_BIN)" -inferred=false $$files "$$canary" 2>&1) ; \
 	status=$$? ; \
-	if [ $$status -eq 0 ] || ! printf '%s\n' "$$out" | grep -q "invalid field access" ; then \
-		echo "the checklocks analysis no longer reports the unguarded write in $(CHECKLOCKS_CANARY):" ; \
+	if [ $$status -eq 0 ] || ! printf '%s\n' "$$out" | grep -q "invalid field access" \
+		|| ! printf '%s\n' "$$out" | grep -q "must not hold" ; then \
+		echo "the checklocks analysis no longer reports the unguarded write or the re-entry" ; \
+		echo "in $(CHECKLOCKS_CANARY):" ; \
 		echo "$$out" ; \
 		echo "nothing this target reports can be trusted, see $(CHECKLOCKS_CANARY)" ; \
 		exit 1 ; \

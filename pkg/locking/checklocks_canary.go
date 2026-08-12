@@ -26,13 +26,15 @@ package locking
 // analysed even when a build constraint excludes them, so the target can hand this file to
 // the analysis without it ever becoming part of the shim.
 //
-// The setValue method below writes a guarded field without holding the lock. The self test
-// asserts that the analysis reports it. Without that assertion checklocks could silently
-// stop finding anything at all and every run would still be green: the lock wrappers are
-// recognised by their name, so renaming them, changing the forwarding methods or moving to
-// a gvisor version that behaves differently all end in an analysis that reports nothing.
-// The fixture uses the wrappers of this package, which makes the self test cover the whole
-// chain: wrapper type, forwarding methods and field annotation.
+// The fixture holds one violation of each annotation class that is in use: setValue writes
+// a guarded field without holding the lock and reEnter calls a method that must not be
+// called with the lock held while holding it. The self test asserts that the analysis
+// reports both. Without that assertion checklocks could silently stop finding anything at
+// all and every run would still be green: the lock wrappers are recognised by their name,
+// so renaming them, changing the forwarding methods or moving to a gvisor version that
+// behaves differently all end in an analysis that reports nothing. The fixture uses the
+// wrappers of this package, which makes the self test cover the whole chain: wrapper type,
+// forwarding methods, field annotation and lock precondition.
 
 type canary struct {
 	lock RWMutex
@@ -52,4 +54,22 @@ func (c *canary) setValueLocked(value int) {
 // requires the analysis to report "invalid field access" for this line.
 func (c *canary) setValue(value int) {
 	c.value = value
+}
+
+// setValueSelfLocking takes the lock itself, which makes it invalid to call while the lock
+// is held. It must never be reported itself.
+// +checklocksexclude:c.lock
+func (c *canary) setValueSelfLocking(value int) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.value = value
+}
+
+// reEnter calls a method that excludes the lock while holding it, the self deadlock shape.
+// The self test in the Makefile requires the analysis to report "must not hold" for this
+// line.
+func (c *canary) reEnter(value int) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.setValueSelfLocking(value)
 }
