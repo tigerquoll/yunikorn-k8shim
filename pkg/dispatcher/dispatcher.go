@@ -82,20 +82,18 @@ func initDispatcher() {
 }
 
 // The functions below are the self locking API of this package: they take the lock of the
-// dispatcher singleton, so it must not be held when they are called. That contract is not
-// expressed as a "+checklocksexclude" annotation, because the only name the lock has is a field
-// of the package level dispatcher variable and checklocks cannot enforce that shape:
-//   - the variable is a pointer, and an annotation naming dispatcher.lock resolves to the lock
-//     field of the variable itself while an acquisition resolves through the pointer. The two
-//     never compare equal, so an exclusion is silently inert and a precondition reports every
-//     correctly locked caller. Writing the dereference is a parse error.
-//   - the variable is also unexported, so even a working annotation would only be enforced in
-//     this package: export data does not carry unexported package level variables, which makes
-//     the guard unresolvable in pkg/cache and pkg/shim where the callers live.
+// dispatcher singleton, so it must not be held when they are called. The annotations say so, and
+// the analysis enforces them for a caller in this package that holds the lock through the
+// package level variable. Two shapes it cannot see:
+//   - a caller that reaches the lock through getDispatcher() rather than the variable. The
+//     analysis has no way to know the returned pointer is that variable, so it does not know the
+//     lock the caller holds is the excluded one.
+//   - a caller in another package. The variable is unexported and export data does not carry
+//     unexported package level variables, so the guard cannot be resolved in pkg/cache or
+//     pkg/shim where most callers live.
 //
-// The guarded field annotation on Dispatcher.handlers does work: it names the lock through the
-// struct, not through the global. What crosses packages is covered by the runtime lock class
-// order check instead.
+// The runtime lock class order check covers what crosses packages.
+// +checklocksexclude:dispatcher.lock
 func RegisterEventHandler(handlerID string, eventType EventType, handlerFn func(interface{})) {
 	eventDispatcher := getDispatcher()
 	eventDispatcher.lock.Lock()
@@ -106,6 +104,7 @@ func RegisterEventHandler(handlerID string, eventType EventType, handlerFn func(
 	eventDispatcher.handlers[eventType][handlerID] = handlerFn
 }
 
+// +checklocksexclude:dispatcher.lock
 func UnregisterEventHandler(handlerID string, eventType EventType) {
 	eventDispatcher := getDispatcher()
 	eventDispatcher.lock.Lock()
@@ -118,6 +117,7 @@ func UnregisterEventHandler(handlerID string, eventType EventType) {
 	}
 }
 
+// +checklocksexclude:dispatcher.lock
 func UnregisterAllEventHandlers() {
 	eventDispatcher := getDispatcher()
 	eventDispatcher.lock.Lock()
@@ -126,6 +126,7 @@ func UnregisterAllEventHandlers() {
 }
 
 // a thread-safe way to get event handlers
+// +checklocksexcludewrite:dispatcher.lock
 func getEventHandler(eventType EventType) func(interface{}) {
 	eventDispatcher := getDispatcher()
 	eventDispatcher.lock.RLock()

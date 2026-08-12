@@ -20,10 +20,18 @@
 */
 
 // Package tools pins the build dependencies of the checklocks vet tool. It is a module of
-// its own so that gvisor does not become a dependency of the shim itself, the module is
+// its own so that the analyser does not become a dependency of the shim itself, the module is
 // never built as part of the shim. See the "checklocks" target in the Makefile.
+//
+// The analyser is gVisor's tools/checklocks, which gVisor does not publish as an importable
+// module. github.com/tigerquoll/checklocks is a standalone extraction of it, taken from gvisor
+// commit 1919d963, carrying three fixes that the shim annotations need and that are on their
+// way upstream: the panic on cross package use of unexported global guards (filed as
+// google/gvisor#14078), resolving pointer typed global guards through the pointer, and guard
+// annotations on package level variable declarations. That repository says of itself that it is
+// a temporary home, so expect this pin to move once the fixes land upstream.
 package tools
 
 import (
-	_ "gvisor.dev/gvisor/tools/checklocks/cmd/checklocks"
+	_ "github.com/tigerquoll/checklocks/cmd/checklocks"
 )
