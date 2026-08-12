@@ -31,6 +31,7 @@ import (
 )
 
 type NamespaceCache struct {
+	// +checklocks:RWMutex
 	nameSpaces map[string]nsFlags
 
 	locking.RWMutex
@@ -69,6 +70,7 @@ func NewNamespaceCache(namespaces informersv1.NamespaceInformer) (*NamespaceCach
 }
 
 // enableYuniKorn returns the value for the enableYuniKorn flag (tri-state UNSET, TRUE or FALSE) for the namespace.
+// +checklocksexcludewrite:nsc.RWMutex
 func (nsc *NamespaceCache) enableYuniKorn(name string) triState {
 	nsc.RLock()
 	defer nsc.RUnlock()
@@ -81,6 +83,7 @@ func (nsc *NamespaceCache) enableYuniKorn(name string) triState {
 }
 
 // generateAppID returns the value for the generateAppID flag (tri-state UNSET, TRUE or FALSE) for the namespace.
+// +checklocksexcludewrite:nsc.RWMutex
 func (nsc *NamespaceCache) generateAppID(name string) triState {
 	nsc.RLock()
 	defer nsc.RUnlock()
@@ -93,6 +96,7 @@ func (nsc *NamespaceCache) generateAppID(name string) triState {
 }
 
 // namespaceExists for test only to see if the namespace has been added to the cache or not.
+// +checklocksexcludewrite:nsc.RWMutex
 func (nsc *NamespaceCache) namespaceExists(name string) bool {
 	nsc.RLock()
 	defer nsc.RUnlock()
@@ -109,6 +113,7 @@ type namespaceUpdateHandler struct {
 // OnAdd adds or replaces the namespace entry in the cache.
 // The cached value is only the resulting value of the annotation, not the whole namespace object.
 // An empty string for the Name is technically possible but should not occur.
+// +checklocksexclude:h.cache.RWMutex
 func (h *namespaceUpdateHandler) OnAdd(obj interface{}, _ bool) {
 	ns := convert2Namespace(obj)
 	if ns == nil {
@@ -122,11 +127,13 @@ func (h *namespaceUpdateHandler) OnAdd(obj interface{}, _ bool) {
 }
 
 // OnUpdate calls OnAdd for processing the namespace cache update.
+// +checklocksexclude:h.cache.RWMutex
 func (h *namespaceUpdateHandler) OnUpdate(_, newObj interface{}) {
 	h.OnAdd(newObj, false)
 }
 
 // OnDelete removes the namespace from the cache.
+// +checklocksexclude:h.cache.RWMutex
 func (h *namespaceUpdateHandler) OnDelete(obj interface{}) {
 	var ns *v1.Namespace
 	switch t := obj.(type) {

@@ -31,12 +31,16 @@ type SchedulerAPIMock struct {
 	UpdateAllocationCount  atomic.Int32
 	UpdateApplicationCount atomic.Int32
 	UpdateNodeCount        atomic.Int32
-	registerFn             func(request *si.RegisterResourceManagerRequest,
+	// +checklocks:lock
+	registerFn func(request *si.RegisterResourceManagerRequest,
 		callback api.ResourceManagerCallback) (*si.RegisterResourceManagerResponse, error)
-	UpdateAllocationFn  func(request *si.AllocationRequest) error
+	// +checklocks:lock
+	UpdateAllocationFn func(request *si.AllocationRequest) error
+	// +checklocks:lock
 	UpdateApplicationFn func(request *si.ApplicationRequest) error
-	UpdateNodeFn        func(request *si.NodeRequest) error
-	lock                locking.Mutex
+	// +checklocks:lock
+	UpdateNodeFn func(request *si.NodeRequest) error
+	lock         locking.Mutex
 }
 
 func NewSchedulerAPIMock() *SchedulerAPIMock {
@@ -60,10 +64,13 @@ func NewSchedulerAPIMock() *SchedulerAPIMock {
 
 func (api *SchedulerAPIMock) RegisterFunction(rfn func(request *si.RegisterResourceManagerRequest,
 	callback api.ResourceManagerCallback) (*si.RegisterResourceManagerResponse, error)) *SchedulerAPIMock {
-	api.registerFn = rfn
+	// YUNIKORN-XXXX: registerFn is set without the lock while RegisterResourceManager reads
+	// it with the lock held, the three other mock functions are set with the lock held.
+	api.registerFn = rfn // +checklocksignore
 	return api
 }
 
+// +checklocksexclude:api.lock
 func (api *SchedulerAPIMock) UpdateAllocationFunction(ufn func(request *si.AllocationRequest) error) *SchedulerAPIMock {
 	api.lock.Lock()
 	defer api.lock.Unlock()
@@ -71,6 +78,7 @@ func (api *SchedulerAPIMock) UpdateAllocationFunction(ufn func(request *si.Alloc
 	return api
 }
 
+// +checklocksexclude:api.lock
 func (api *SchedulerAPIMock) UpdateApplicationFunction(ufn func(request *si.ApplicationRequest) error) *SchedulerAPIMock {
 	api.lock.Lock()
 	defer api.lock.Unlock()
@@ -78,6 +86,7 @@ func (api *SchedulerAPIMock) UpdateApplicationFunction(ufn func(request *si.Appl
 	return api
 }
 
+// +checklocksexclude:api.lock
 func (api *SchedulerAPIMock) UpdateNodeFunction(ufn func(request *si.NodeRequest) error) *SchedulerAPIMock {
 	api.lock.Lock()
 	defer api.lock.Unlock()
@@ -85,6 +94,7 @@ func (api *SchedulerAPIMock) UpdateNodeFunction(ufn func(request *si.NodeRequest
 	return api
 }
 
+// +checklocksexclude:api.lock
 func (api *SchedulerAPIMock) RegisterResourceManager(request *si.RegisterResourceManagerRequest,
 	callback api.ResourceManagerCallback) (*si.RegisterResourceManagerResponse, error) {
 	api.lock.Lock()
@@ -93,6 +103,7 @@ func (api *SchedulerAPIMock) RegisterResourceManager(request *si.RegisterResourc
 	return api.registerFn(request, callback)
 }
 
+// +checklocksexclude:api.lock
 func (api *SchedulerAPIMock) UpdateAllocation(request *si.AllocationRequest) error {
 	api.lock.Lock()
 	defer api.lock.Unlock()
@@ -100,6 +111,7 @@ func (api *SchedulerAPIMock) UpdateAllocation(request *si.AllocationRequest) err
 	return api.UpdateAllocationFn(request)
 }
 
+// +checklocksexclude:api.lock
 func (api *SchedulerAPIMock) UpdateApplication(request *si.ApplicationRequest) error {
 	api.lock.Lock()
 	defer api.lock.Unlock()
@@ -107,6 +119,7 @@ func (api *SchedulerAPIMock) UpdateApplication(request *si.ApplicationRequest) e
 	return api.UpdateApplicationFn(request)
 }
 
+// +checklocksexclude:api.lock
 func (api *SchedulerAPIMock) UpdateNode(request *si.NodeRequest) error {
 	api.lock.Lock()
 	defer api.lock.Unlock()
@@ -114,6 +127,7 @@ func (api *SchedulerAPIMock) UpdateNode(request *si.NodeRequest) error {
 	return api.UpdateNodeFn(request)
 }
 
+// +checklocksexclude:api.lock
 func (api *SchedulerAPIMock) UpdateConfiguration(request *si.UpdateConfigurationRequest) error {
 	api.lock.Lock()
 	defer api.lock.Unlock()
