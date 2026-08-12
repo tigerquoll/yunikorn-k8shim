@@ -48,10 +48,12 @@ type PlaceholderManager struct {
 }
 
 var (
+	// +checklocks:mu
 	placeholderMgr *PlaceholderManager
 	mu             locking.Mutex
 )
 
+// +checklocksexclude:mu
 func NewPlaceholderManager(clients *client.Clients) *PlaceholderManager {
 	mu.Lock()
 	defer mu.Unlock()
@@ -65,6 +67,7 @@ func NewPlaceholderManager(clients *client.Clients) *PlaceholderManager {
 	return placeholderMgr
 }
 
+// +checklocksexclude:mu
 func getPlaceholderManager() *PlaceholderManager {
 	mu.Lock()
 	defer mu.Unlock()

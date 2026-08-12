@@ -81,11 +81,21 @@ func initDispatcher() {
 		zap.Float64("DispatchTimeoutInSeconds", dispatcher.dispatchTimeout.Seconds()))
 }
 
-// The functions below take the dispatcher lock. They carry no "+checklocksexclude"
-// annotation even though they are the self locking API of this package: the lock is only
-// reachable through the package level dispatcher variable and resolving a lock held by a
-// global at an analysed call site crashes the pinned checklocks version in
-// globalGuard.resolveCall. Revisit when the tool is updated.
+// The functions below are the self locking API of this package: they take the lock of the
+// dispatcher singleton, so it must not be held when they are called. That contract is not
+// expressed as a "+checklocksexclude" annotation, because the only name the lock has is a field
+// of the package level dispatcher variable and checklocks cannot enforce that shape:
+//   - the variable is a pointer, and an annotation naming dispatcher.lock resolves to the lock
+//     field of the variable itself while an acquisition resolves through the pointer. The two
+//     never compare equal, so an exclusion is silently inert and a precondition reports every
+//     correctly locked caller. Writing the dereference is a parse error.
+//   - the variable is also unexported, so even a working annotation would only be enforced in
+//     this package: export data does not carry unexported package level variables, which makes
+//     the guard unresolvable in pkg/cache and pkg/shim where the callers live.
+//
+// The guarded field annotation on Dispatcher.handlers does work: it names the lock through the
+// struct, not through the global. What crosses packages is covered by the runtime lock class
+// order check instead.
 func RegisterEventHandler(handlerID string, eventType EventType, handlerFn func(interface{})) {
 	eventDispatcher := getDispatcher()
 	eventDispatcher.lock.Lock()
