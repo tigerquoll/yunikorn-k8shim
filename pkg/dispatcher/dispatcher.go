@@ -49,10 +49,11 @@ const (
 type Dispatcher struct {
 	eventChan chan events.SchedulingEvent
 	stopChan  chan struct{}
-	handlers  map[EventType]map[string]func(interface{})
-	running   atomic.Bool
-	lock      locking.RWMutex
-	stopped   sync.WaitGroup
+	// +checklocks:lock
+	handlers map[EventType]map[string]func(interface{})
+	running  atomic.Bool
+	lock     locking.RWMutex
+	stopped  sync.WaitGroup
 
 	asyncDispatchLimit         int32
 	asyncDispatchCheckInterval time.Duration
@@ -80,6 +81,11 @@ func initDispatcher() {
 		zap.Float64("DispatchTimeoutInSeconds", dispatcher.dispatchTimeout.Seconds()))
 }
 
+// The functions below take the dispatcher lock. They carry no "+checklocksexclude"
+// annotation even though they are the self locking API of this package: the lock is only
+// reachable through the package level dispatcher variable and resolving a lock held by a
+// global at an analysed call site crashes the pinned checklocks version in
+// globalGuard.resolveCall. Revisit when the tool is updated.
 func RegisterEventHandler(handlerID string, eventType EventType, handlerFn func(interface{})) {
 	eventDispatcher := getDispatcher()
 	eventDispatcher.lock.Lock()
