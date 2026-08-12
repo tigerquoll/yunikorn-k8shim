@@ -40,6 +40,7 @@ import (
 	"github.com/apache/yunikorn-scheduler-interface/lib/go/si"
 )
 
+// +lockclass:cache.Application
 type Application struct {
 	applicationID string
 	queue         string
@@ -81,6 +82,7 @@ const transitionErr = "no transition"
 // submission path.
 // YUNIKORN-XXXX: that leaves taskMap read without the lock while other threads can add or
 // remove tasks. The fix is a snapshot taken by the caller, not a lock in this method.
+// +lockstringerignore
 func (app *Application) String() string {
 	return fmt.Sprintf("applicationID: %s, queue: %s, partition: %s,"+
 		" totalNumOfTasks: %d, currentState: %s",
@@ -801,6 +803,11 @@ func (app *Application) clearReleaseableTasks() {
 
 // flushReleaseableTasks replays deferred task releases after the application has been accepted
 // by the scheduler core. Must be called while the application lock is held.
+//
+// YUNIKORN-XXXX: releaseAllocation reaches tryAddReleasableTask, which takes the application
+// lock this call already holds. Only the force argument keeps it away from that path, so the
+// analysis reports a nesting it cannot rule out. Restructure rather than rely on the flag.
+// +lockorderignore
 // +checklocks:app.lock
 func (app *Application) flushReleaseableTasks() {
 	if len(app.releaseableTasks) == 0 {

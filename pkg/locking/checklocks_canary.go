@@ -21,6 +21,8 @@
 
 package locking
 
+import "fmt"
+
 // This file is never built, the build constraint above is never set. It is the fixture for
 // the self test of the "checklocks" make target: files named on the go vet command line are
 // analysed even when a build constraint excludes them, so the target can hand this file to
@@ -36,6 +38,7 @@ package locking
 // wrappers of this package, which makes the self test cover the whole chain: wrapper type,
 // forwarding methods, field annotation and lock precondition.
 
+// +lockclass:canary.Canary
 type canary struct {
 	lock RWMutex
 	// +checklocks:lock
@@ -67,9 +70,39 @@ func (c *canary) setValueSelfLocking(value int) {
 
 // reEnter calls a method that excludes the lock while holding it, the self deadlock shape.
 // The self test in the Makefile requires the analysis to report "must not hold" for this
-// line.
+// line. The order analysis sees the same call as a nesting of two locks of one class; it is
+// silenced here so that nestSameClass stays the only source of that diagnostic and the self
+// test keeps one fixture per analysis.
+// +lockorderignore
 func (c *canary) reEnter(value int) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	c.setValueSelfLocking(value)
+}
+
+// nestSameClass locks two canaries at once. Two locks of one class must not nest, which the
+// order analysis reports without needing an edge, so the fixture states it without adding
+// anything to the taxonomy of the shim.
+func (c *canary) nestSameClass(other *canary) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	other.lock.Lock()
+	defer other.lock.Unlock()
+}
+
+// String reads a guarded field from a method that is evaluated wherever a log entry is encoded,
+// which the stringer analysis reports. The guarded field check is silenced here on purpose: it
+// is the usual way this hazard is hidden, and the stringer analysis is meant to report it
+// anyway. That also leaves setValue as the only source of the guarded field diagnostic, so the
+// self test covers one fixture per analysis.
+// +checklocksignore
+func (c *canary) String() string {
+	return fmt.Sprintf("canary %d", c.value)
+}
+
+// waitUnderLock waits on a channel with the lock held, which the blocking analysis reports.
+func (c *canary) waitUnderLock(ch chan int) int {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	return <-ch
 }

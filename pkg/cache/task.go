@@ -39,6 +39,7 @@ import (
 	"github.com/apache/yunikorn-scheduler-interface/lib/go/si"
 )
 
+// +lockclass:cache.Task
 type Task struct {
 	taskID        string
 	alias         string

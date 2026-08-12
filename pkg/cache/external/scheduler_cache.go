@@ -40,6 +40,7 @@ import (
 // SchedulerCache maintains some critical information about nodes and pods used for scheduling.
 // Nodes are cached in the form of de-scheduler nodeInfo. Instead of re-creating all nodes info from scratch,
 // we replicate nodes info from de-scheduler, in order to re-use predicates functions.
+// +lockclass:external.SchedulerCache
 type SchedulerCache struct {
 	// +checklocks:lock
 	nodesMap map[string]*framework.NodeInfo // node name to NodeInfo map

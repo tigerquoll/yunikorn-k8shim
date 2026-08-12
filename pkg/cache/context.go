@@ -69,6 +69,7 @@ var (
 )
 
 // context maintains scheduling state, like apps and apps' tasks.
+// +lockclass:cache.Context
 type Context struct {
 	// +checklocks:lock
 	applications   map[string]*Application        // apps

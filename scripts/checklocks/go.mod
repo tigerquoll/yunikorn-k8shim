@@ -20,7 +20,7 @@ module github.com/apache/yunikorn-k8shim/scripts/checklocks
 
 go 1.25.0
 
-require github.com/tigerquoll/checklocks v0.1.0
+require github.com/tigerquoll/checklocks v0.2.0
 
 require (
 	golang.org/x/mod v0.34.0 // indirect

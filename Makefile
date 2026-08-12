@@ -373,22 +373,30 @@ lint: $(GOLANGCI_LINT_BIN)
 # Only the non test files of each package are checked, go vet has no way to exclude test
 # files so they are passed to it explicitly. The inferred lock analysis is turned off, it
 # only produces suggestions, and those are unstable and cannot always be acted upon.
+# The four analyses are named rather than left to the defaults of the tool, so that a release
+# that changes what runs by default cannot silently stop one of them:
+#   checklocks    guarded fields and the lock preconditions of a function
+#   lockorder     the acquisition order of the lock classes declared in pkg/locking
+#   lockstringer  lazily evaluated methods reading guarded fields
+#   lockblocking  waits taken while a declared lock class is held
 # The run starts with a self test on a fixture that must be reported, see the canary file
 # in pkg/locking: an analysis that reports nothing at all would pass this target silently.
-# The self test covers one violation of each annotation class in use, a guarded field and a
-# lock precondition, both must show up in its output.
+# The fixture carries one violation per analysis and all four have to show up in its output.
+CHECKLOCKS_ANALYZERS := -checklocks -lockorder -lockstringer -lockblocking -checklocks.inferred=false
 CHECKLOCKS_PACKAGES := $(REPO)/...
 checklocks: $(CHECKLOCKS_BIN)
 	@$(checklocks_check_toolchain)
 	@echo "running checklocks self test"
 	@files=$$("$(GO)" list -f '{{$$dir := .Dir}}{{range .GoFiles}}{{$$dir}}/{{.}} {{end}}' $(REPO)/locking) ; \
 	canary=$$("$(GO)" list -f '{{.Dir}}' $(REPO)/locking)/$(CHECKLOCKS_CANARY) ; \
-	out=$$("$(GO)" vet "-vettool=$(BASE_DIR)/$(CHECKLOCKS_BIN)" -inferred=false $$files "$$canary" 2>&1) ; \
+	out=$$("$(GO)" vet "-vettool=$(BASE_DIR)/$(CHECKLOCKS_BIN)" $(CHECKLOCKS_ANALYZERS) $$files "$$canary" 2>&1) ; \
 	status=$$? ; \
-	if [ $$status -eq 0 ] || ! printf '%s\n' "$$out" | grep -q "invalid field access" \
-		|| ! printf '%s\n' "$$out" | grep -q "must not hold" ; then \
-		echo "the checklocks analysis no longer reports the unguarded write or the re-entry" ; \
-		echo "in $(CHECKLOCKS_CANARY):" ; \
+	missing="" ; \
+	for want in "invalid field access" "must not hold" "must not nest" "guarded read races" "a wait under a lock stalls" ; do \
+		printf '%s\n' "$$out" | grep -q "$$want" || missing="$$missing\n  $$want" ; \
+	done ; \
+	if [ $$status -eq 0 ] || [ -n "$$missing" ] ; then \
+		echo "the analysis of $(CHECKLOCKS_CANARY) no longer reports:$$missing" ; \
 		echo "$$out" ; \
 		echo "nothing this target reports can be trusted, see $(CHECKLOCKS_CANARY)" ; \
 		exit 1 ; \
@@ -397,7 +405,7 @@ checklocks: $(CHECKLOCKS_BIN)
 	@status=0 ; \
 	for pkg in $$("$(GO)" list $(CHECKLOCKS_PACKAGES)) ; do \
 		files=$$("$(GO)" list -f '{{$$dir := .Dir}}{{range .GoFiles}}{{$$dir}}/{{.}} {{end}}' "$$pkg") ; \
-		"$(GO)" vet "-vettool=$(BASE_DIR)/$(CHECKLOCKS_BIN)" -inferred=false $$files || status=1 ; \
+		"$(GO)" vet "-vettool=$(BASE_DIR)/$(CHECKLOCKS_BIN)" $(CHECKLOCKS_ANALYZERS) $$files || status=1 ; \
 	done ; \
 	exit $$status
 

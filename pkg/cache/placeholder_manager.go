@@ -32,6 +32,7 @@ import (
 )
 
 // PlaceholderManager is a service to manage the lifecycle of app placeholders
+// +lockclass:cache.PlaceholderManager
 type PlaceholderManager struct {
 	// clients can neve be nil, even the kubeclient cannot be nil as the shim will not start without it
 	clients *client.Clients
