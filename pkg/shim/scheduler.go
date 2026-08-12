@@ -44,12 +44,13 @@ import (
 
 // shim scheduler watches api server and interacts with unity scheduler to allocate pods
 type KubernetesShim struct {
-	apiFactory           client.APIProvider
-	context              *cache.Context
-	phManager            *cache.PlaceholderManager
-	callback             api.ResourceManagerCallback
-	stopChan             chan struct{}
-	lock                 *locking.RWMutex
+	apiFactory client.APIProvider
+	context    *cache.Context
+	phManager  *cache.PlaceholderManager
+	callback   api.ResourceManagerCallback
+	stopChan   chan struct{}
+	lock       *locking.RWMutex
+	// +checklocks:lock
 	outstandingAppsFound bool
 }
 
@@ -244,12 +245,14 @@ func (ss *KubernetesShim) checkOutstandingApps() {
 	ss.setOutstandingAppsFound(false)
 }
 
+// +checklocksexcludewrite:ss.lock
 func (ss *KubernetesShim) getOutstandingAppsFound() bool {
 	ss.lock.RLock()
 	defer ss.lock.RUnlock()
 	return ss.outstandingAppsFound
 }
 
+// +checklocksexclude:ss.lock
 func (ss *KubernetesShim) setOutstandingAppsFound(value bool) {
 	ss.lock.Lock()
 	defer ss.lock.Unlock()

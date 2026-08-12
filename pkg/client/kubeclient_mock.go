@@ -41,10 +41,13 @@ type KubeClientMock struct {
 	updateStatusFn func(pod *v1.Pod) (*v1.Pod, error)
 	getFn          func(podName string) (*v1.Pod, error)
 	clientSet      kubernetes.Interface
-	pods           map[string]*v1.Pod
-	lock           locking.RWMutex
-	bindStats      BindStats
-	boundPods      []BoundPod
+	// +checklocks:lock
+	pods map[string]*v1.Pod
+	lock locking.RWMutex
+	// +checklocks:lock
+	bindStats BindStats
+	// +checklocks:lock
+	boundPods []BoundPod
 }
 
 // BindStats statistics about KubeClientMock.Bind() calls
@@ -111,9 +114,12 @@ func NewKubeClientMock(err bool) *KubeClientMock {
 		boundPods: make([]BoundPod, 0, 1024),
 	}
 
+	// this closure is only ever called through kubeMock.bindFn from Bind, which holds the
+	// write lock, the analysis cannot see that through the function field so the accesses to
+	// the guarded fields below are ignored
 	kubeMock.bindFn = func(pod *v1.Pod, hostID string) error {
 		// kubeMock must be locked for this
-		stats := &kubeMock.bindStats
+		stats := &kubeMock.bindStats // +checklocksignore
 
 		if err {
 			stats.Errors++
@@ -129,7 +135,7 @@ func NewKubeClientMock(err bool) *KubeClientMock {
 		}
 		stats.Last = now
 		stats.LastPod = pod.Name
-		kubeMock.boundPods = append(kubeMock.boundPods, BoundPod{
+		kubeMock.boundPods = append(kubeMock.boundPods, BoundPod{ // +checklocksignore
 			Pod:  pod.Name,
 			Host: hostID,
 		})
@@ -153,12 +159,14 @@ func (c *KubeClientMock) MockCreateFn(cfn func(pod *v1.Pod) (*v1.Pod, error)) {
 	c.createFn = cfn
 }
 
+// +checklocksexclude:c.lock
 func (c *KubeClientMock) Bind(pod *v1.Pod, hostID string) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	return c.bindFn(pod, hostID)
 }
 
+// +checklocksexclude:c.lock
 func (c *KubeClientMock) Create(pod *v1.Pod) (*v1.Pod, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -166,6 +174,7 @@ func (c *KubeClientMock) Create(pod *v1.Pod) (*v1.Pod, error) {
 	return c.createFn(pod)
 }
 
+// +checklocksexclude:c.lock
 func (c *KubeClientMock) UpdatePod(pod *v1.Pod, podMutator func(pod *v1.Pod)) (*v1.Pod, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -173,6 +182,7 @@ func (c *KubeClientMock) UpdatePod(pod *v1.Pod, podMutator func(pod *v1.Pod)) (*
 	return c.updateFn(pod, podMutator)
 }
 
+// +checklocksexclude:c.lock
 func (c *KubeClientMock) UpdateStatus(pod *v1.Pod) (*v1.Pod, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -180,6 +190,7 @@ func (c *KubeClientMock) UpdateStatus(pod *v1.Pod) (*v1.Pod, error) {
 	return c.updateStatusFn(pod)
 }
 
+// +checklocksexcludewrite:c.lock
 func (c *KubeClientMock) Get(podNamespace string, podName string) (*v1.Pod, error) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
@@ -191,6 +202,7 @@ func (c *KubeClientMock) Get(podNamespace string, podName string) (*v1.Pod, erro
 	return nil, fmt.Errorf("pod not found: %s/%s", podNamespace, podName)
 }
 
+// +checklocksexclude:c.lock
 func (c *KubeClientMock) Delete(pod *v1.Pod) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -198,30 +210,35 @@ func (c *KubeClientMock) Delete(pod *v1.Pod) error {
 	return c.deleteFn(pod)
 }
 
+// +checklocksexcludewrite:c.lock
 func (c *KubeClientMock) GetClientSet() kubernetes.Interface {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 	return c.clientSet
 }
 
+// +checklocksexcludewrite:c.lock
 func (c *KubeClientMock) GetConfigs() *rest.Config {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 	return nil
 }
 
+// +checklocksexcludewrite:c.lock
 func (c *KubeClientMock) GetConfigMap(namespace string, name string) (*v1.ConfigMap, error) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 	return nil, nil
 }
 
+// +checklocksexcludewrite:c.lock
 func (c *KubeClientMock) GetBindStats() BindStats {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 	return c.bindStats
 }
 
+// +checklocksexclude:c.lock
 func (c *KubeClientMock) GetBoundPods(clear bool) []BoundPod {
 	c.lock.Lock()
 	defer c.lock.Unlock()

@@ -377,7 +377,7 @@ lint: $(GOLANGCI_LINT_BIN)
 # in pkg/locking: an analysis that reports nothing at all would pass this target silently.
 # The self test covers one violation of each annotation class in use, a guarded field and a
 # lock precondition, both must show up in its output.
-CHECKLOCKS_PACKAGES := $(REPO)/locking/... $(REPO)/cache/...
+CHECKLOCKS_PACKAGES := $(REPO)/locking/... $(REPO)/cache/... $(REPO)/client/... $(REPO)/dispatcher/... $(REPO)/plugin/... $(REPO)/shim/...
 checklocks: $(CHECKLOCKS_BIN)
 	@$(checklocks_check_toolchain)
 	@echo "running checklocks self test"
