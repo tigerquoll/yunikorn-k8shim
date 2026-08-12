@@ -104,6 +104,7 @@ func NewContextWithBootstrapConfigMaps(apis client.APIProvider, bootstrapConfigM
 		lock:         &locking.RWMutex{},
 		klogger:      klog.NewKlogr(),
 	}
+	ctx.lock.SetClass(locking.ClassContext)
 
 	// create the cache
 	ctx.schedulerCache = schedulercache.NewSchedulerCache(apis.GetAPIs())

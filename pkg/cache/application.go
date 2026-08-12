@@ -105,6 +105,7 @@ func NewApplication(appID, queueName, user string, groups []string, tags map[str
 		schedulingStyle:         constants.SchedulingPolicyStyleParamDefault,
 		releaseableTasks:        make([]*Task, 0),
 	}
+	app.lock.SetClass(locking.ClassApplication)
 	return app
 }
 
