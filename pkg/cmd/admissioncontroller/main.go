@@ -46,8 +46,9 @@ const (
 )
 
 type WebHook struct {
-	ac     *admission.AdmissionController
-	port   int
+	ac   *admission.AdmissionController
+	port int
+	// +checklocks:Mutex
 	server *http.Server
 	locking.Mutex
 }
@@ -144,6 +145,7 @@ func CreateWebhook(ac *admission.AdmissionController, port int) *WebHook {
 	}
 }
 
+// +checklocksexclude:wh.Mutex
 func (wh *WebHook) Startup(certs *tls.Certificate) {
 	wh.Lock()
 	defer wh.Unlock()
@@ -166,7 +168,9 @@ func (wh *WebHook) Startup(certs *tls.Certificate) {
 	}
 
 	go func() {
-		if err := wh.server.ListenAndServeTLS("", ""); err != nil {
+		// YUNIKORN-XXXX: the server field is read here without the lock, Shutdown can set it
+		// to nil concurrently. Capture the server in a local before starting the routine.
+		if err := wh.server.ListenAndServeTLS("", ""); err != nil { // +checklocksignore
 			if errors.Is(err, http.ErrServerClosed) {
 				log.Log(log.Admission).Info("existing server closed")
 			} else {
@@ -180,6 +184,7 @@ func (wh *WebHook) Startup(certs *tls.Certificate) {
 		zap.Strings("listeningOn", []string{healthURL, mutateURL, validateConfURL}))
 }
 
+// +checklocksexclude:wh.Mutex
 func (wh *WebHook) Shutdown() {
 	wh.Lock()
 	defer wh.Unlock()

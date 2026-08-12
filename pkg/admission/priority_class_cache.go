@@ -32,6 +32,7 @@ import (
 )
 
 type PriorityClassCache struct {
+	// +checklocks:RWMutex
 	priorityClasses map[string]bool
 
 	locking.RWMutex
@@ -52,6 +53,7 @@ func NewPriorityClassCache(priorityClasses informersv1.PriorityClassInformer) (*
 }
 
 // isPreemptSelfAllowed returns the preemption value. Only returns false if configured.
+// +checklocksexcludewrite:pcc.RWMutex
 func (pcc *PriorityClassCache) isPreemptSelfAllowed(priorityClassName string) bool {
 	pcc.RLock()
 	defer pcc.RUnlock()
@@ -64,6 +66,7 @@ func (pcc *PriorityClassCache) isPreemptSelfAllowed(priorityClassName string) bo
 }
 
 // priorityClassExists for test only to see if the PriorityClass has been added to the cache or not.
+// +checklocksexcludewrite:pcc.RWMutex
 func (pcc *PriorityClassCache) priorityClassExists(priorityClassName string) bool {
 	pcc.RLock()
 	defer pcc.RUnlock()
@@ -80,6 +83,7 @@ type priorityClassUpdateHandler struct {
 // OnAdd adds or replaces the priority class entry in the cache.
 // The cached value is only the resulting value of the annotation, not the whole PriorityClass object.
 // An empty string for the Name is technically possible but should not occur.
+// +checklocksexclude:h.cache.RWMutex
 func (h *priorityClassUpdateHandler) OnAdd(obj interface{}, _ bool) {
 	pc := utils.Convert2PriorityClass(obj)
 	if pc == nil {
@@ -93,11 +97,13 @@ func (h *priorityClassUpdateHandler) OnAdd(obj interface{}, _ bool) {
 }
 
 // OnUpdate calls OnAdd for processing the PriorityClass cache update.
+// +checklocksexclude:h.cache.RWMutex
 func (h *priorityClassUpdateHandler) OnUpdate(_, newObj interface{}) {
 	h.OnAdd(newObj, false)
 }
 
 // OnDelete removes the PriorityClass from the cache.
+// +checklocksexclude:h.cache.RWMutex
 func (h *priorityClassUpdateHandler) OnDelete(obj interface{}) {
 	var pc *schedulingv1.PriorityClass
 	switch t := obj.(type) {

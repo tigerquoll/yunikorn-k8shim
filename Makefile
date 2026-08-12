@@ -363,13 +363,11 @@ lint: $(GOLANGCI_LINT_BIN)
 	@echo "running golangci-lint"
 	@"${GOLANGCI_LINT_BIN}" run
 
-# Check the lock annotations of the packages that are annotated. Packages are added to the
-# list one by one as the annotation coverage grows: an unannotated package still triggers
-# lock balance errors which would fail the check. Two things to be aware of when adding a
-# package: the "+checklocks:" requirements of a function are only enforced for callers in
-# the listed packages, so a package can be clean until its callers are added, and adding a
-# package can require annotating its calls into packages that are already annotated (for
-# instance the listers in pkg/plugin/support call the annotated scheduler cache).
+# Check the lock annotations. The list covers every package of the shim now that all locked
+# structs are annotated, it is kept as a variable because a new package with locks in it has
+# to be annotated before it can be checked: an unannotated package still triggers lock
+# balance errors which would fail the check. Note that the "+checklocks:" requirements of a
+# function are only enforced for callers in the listed packages.
 # Only the non test files of each package are checked, go vet has no way to exclude test
 # files so they are passed to it explicitly. The inferred lock analysis is turned off, it
 # only produces suggestions, and those are unstable and cannot always be acted upon.
@@ -377,7 +375,7 @@ lint: $(GOLANGCI_LINT_BIN)
 # in pkg/locking: an analysis that reports nothing at all would pass this target silently.
 # The self test covers one violation of each annotation class in use, a guarded field and a
 # lock precondition, both must show up in its output.
-CHECKLOCKS_PACKAGES := $(REPO)/locking/... $(REPO)/cache/... $(REPO)/client/... $(REPO)/dispatcher/... $(REPO)/plugin/... $(REPO)/shim/...
+CHECKLOCKS_PACKAGES := $(REPO)/...
 checklocks: $(CHECKLOCKS_BIN)
 	@$(checklocks_check_toolchain)
 	@echo "running checklocks self test"
