@@ -19,12 +19,22 @@
 package locking
 
 import (
+	"fmt"
+	"os"
+	"strconv"
 	"sync"
+	"sync/atomic"
 
 	godeadlock "github.com/sasha-s/go-deadlock"
 
 	corelocking "github.com/apache/yunikorn-core/pkg/locking"
 )
+
+// EnvClassOrderEnabled turns the lock class order check on, see lockclass.go. It sits next to the
+// DEADLOCK_* variables that the core locking package reads, the check is a part of the same
+// diagnostic build: it is only compiled in under the "deadlock" build tag and only active when this
+// is set.
+const EnvClassOrderEnabled = "DEADLOCK_CLASS_ORDER_ENABLED"
 
 var once sync.Once
 
@@ -32,68 +42,34 @@ func init() {
 	once.Do(func() {
 		// call into core locking package to ensure that all locks are globally configured
 		corelocking.IsTrackingEnabled()
+		initClassOrder()
 	})
+}
+
+// initClassOrder reads the switch of the lock class order check. The reporting itself goes through
+// the go-deadlock options that the core locking package has just configured, so that an order
+// violation is reported and acted on exactly like a detected deadlock.
+func initClassOrder() {
+	classOrder, err := strconv.ParseBool(os.Getenv(EnvClassOrderEnabled))
+	if err != nil {
+		classOrder = false
+	}
+	classOrderEnabled.Store(classOrder && classOrderSupported)
+	if classOrder && classOrderSupported {
+		// written before anything else is initialised, same as the core message
+		// no way to handle errors just ignore
+		_, _ = fmt.Fprintf(os.Stderr, "=== Lock class order checking enabled ===\n")
+	}
 }
 
 type Mutex struct {
 	mu godeadlock.Mutex
+	// class is the ordering class, see lockclass.go. Zero means the lock is not ordered.
+	class atomic.Uint32
 }
 
 type RWMutex struct {
 	mu godeadlock.RWMutex
-}
-
-// The methods below forward to the inner lock, they are the complete lock API of this
-// package. Two things about the shape are deliberate:
-//
-// The inner lock is a named field and not embedded. Embedding promotes the whole
-// go-deadlock API, which includes TryLock, TryRLock and RLocker. The first two would be
-// tracked against the inner field by the gVisor checklocks analysis instead of the wrapper
-// and the last one hands out a plain sync.Locker that cannot be tracked at all. With a
-// named field none of them exist on the wrapper: using one becomes a compile error and thus
-// a deliberate decision instead of a silent hole in the analysis.
-//
-// The forwarding itself exists so that checklocks (see the "checklocks" make target) tracks
-// the locking.Mutex and locking.RWMutex fields directly. When the inner lock is called
-// directly the analysis attributes the acquisition to the inner field, i.e. "lock.mu"
-// instead of "lock", and all "+checklocks:" field annotations fail to match. The forwarders
-// are ignored by the analysis: a lock method acquires a lock and returns while holding it,
-// which is exactly what its lock balance check flags. The ignore is not entirely free, it
-// also suppresses the "already locked" and "unlock without lock" diagnostics at every call
-// site. The lock state tracking itself is unaffected: guarded field access, the lock
-// preconditions of a function and the lock balance of the calling function are all still
-// checked.
-//
-// The forwarding costs nothing at runtime, the methods are inlined. The only visible effect
-// is one extra stack frame in a go-deadlock report: the "<<<<<" marker points at the
-// forwarder in this file with the real caller one frame below it.
-
-// +checklocksignore
-func (m *Mutex) Lock() {
-	m.mu.Lock()
-}
-
-// +checklocksignore
-func (m *Mutex) Unlock() {
-	m.mu.Unlock()
-}
-
-// +checklocksignore
-func (m *RWMutex) Lock() {
-	m.mu.Lock()
-}
-
-// +checklocksignore
-func (m *RWMutex) Unlock() {
-	m.mu.Unlock()
-}
-
-// +checklocksignore
-func (m *RWMutex) RLock() {
-	m.mu.RLock()
-}
-
-// +checklocksignore
-func (m *RWMutex) RUnlock() {
-	m.mu.RUnlock()
+	// class is the ordering class, see lockclass.go. Zero means the lock is not ordered.
+	class atomic.Uint32
 }
