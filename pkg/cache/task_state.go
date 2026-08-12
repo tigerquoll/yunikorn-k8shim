@@ -375,6 +375,10 @@ func eventDesc(states *TStates) fsm.Events {
 }
 
 func callbacks(states *TStates) fsm.Callbacks {
+	// The callbacks below are invoked by the state machine from Task.handle which holds the
+	// task lock. The dispatch goes through the fsm library so the lock cannot be tracked
+	// across it: the checklocks ignores mark that boundary, the lock requirement itself is
+	// annotated on the callback.
 	return fsm.Callbacks{
 		events.EnterState: func(_ context.Context, event *fsm.Event) {
 			task := event.Args[0].(*Task) //nolint:errcheck
@@ -396,7 +400,7 @@ func callbacks(states *TStates) fsm.Callbacks {
 		},
 		states.Rejected: func(_ context.Context, event *fsm.Event) {
 			task := event.Args[0].(*Task) //nolint:errcheck
-			task.postTaskRejected()
+			task.postTaskRejected()       // +checklocksignore
 		},
 		states.Failed: func(_ context.Context, event *fsm.Event) {
 			task := event.Args[0].(*Task) //nolint:errcheck
@@ -416,11 +420,11 @@ func callbacks(states *TStates) fsm.Callbacks {
 		},
 		states.Bound: func(_ context.Context, event *fsm.Event) {
 			task := event.Args[0].(*Task) //nolint:errcheck
-			task.postTaskBound()
+			task.postTaskBound()          // +checklocksignore
 		},
 		beforeHook(TaskFail): func(_ context.Context, event *fsm.Event) {
 			task := event.Args[0].(*Task) //nolint:errcheck
-			task.beforeTaskFail()
+			task.beforeTaskFail()         // +checklocksignore
 		},
 		beforeHook(TaskAllocated): func(_ context.Context, event *fsm.Event) {
 			task := event.Args[0].(*Task) //nolint:errcheck
@@ -432,15 +436,15 @@ func callbacks(states *TStates) fsm.Callbacks {
 			}
 			allocationKey := eventArgs[0]
 			nodeID := eventArgs[1]
-			task.beforeTaskAllocated(event.Src, allocationKey, nodeID)
+			task.beforeTaskAllocated(event.Src, allocationKey, nodeID) // +checklocksignore
 		},
 		beforeHook(CompleteTask): func(_ context.Context, event *fsm.Event) {
 			task := event.Args[0].(*Task) //nolint:errcheck
-			task.beforeTaskCompleted()
+			task.beforeTaskCompleted()    // +checklocksignore
 		},
 		SubmitTask.String(): func(_ context.Context, event *fsm.Event) {
 			task := event.Args[0].(*Task) //nolint:errcheck
-			task.handleSubmitTaskEvent()
+			task.handleSubmitTaskEvent()  // +checklocksignore
 		},
 	}
 }

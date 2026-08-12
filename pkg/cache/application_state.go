@@ -446,6 +446,10 @@ func newAppState() *fsm.FSM { //nolint:funlen
 				Dst:  states.Killed,
 			},
 		},
+		// The callbacks below are invoked by the state machine from Application.handle which
+		// holds the application lock. The dispatch goes through the fsm library so the lock
+		// cannot be tracked across it: the checklocks ignores mark that boundary, the lock
+		// requirement itself is annotated on the callback.
 		fsm.Callbacks{
 			events.EnterState: func(_ context.Context, event *fsm.Event) {
 				app := event.Args[0].(*Application) //nolint:errcheck
@@ -457,19 +461,19 @@ func newAppState() *fsm.FSM { //nolint:funlen
 			},
 			states.Accepted: func(_ context.Context, event *fsm.Event) {
 				app := event.Args[0].(*Application) //nolint:errcheck
-				app.flushReleaseableTasks()
+				app.flushReleaseableTasks()         // +checklocksignore
 			},
 			states.Reserving: func(_ context.Context, event *fsm.Event) {
 				app := event.Args[0].(*Application) //nolint:errcheck
-				app.onReserving()
+				app.onReserving()                   // +checklocksignore
 			},
 			states.Resuming: func(_ context.Context, event *fsm.Event) {
 				app := event.Args[0].(*Application) //nolint:errcheck
-				app.onResuming()
+				app.onResuming()                    // +checklocksignore
 			},
 			SubmitApplication.String(): func(_ context.Context, event *fsm.Event) {
-				app := event.Args[0].(*Application) //nolint:errcheck
-				event.Err = app.handleSubmitApplicationEvent()
+				app := event.Args[0].(*Application)            //nolint:errcheck
+				event.Err = app.handleSubmitApplicationEvent() // +checklocksignore
 			},
 			RejectApplication.String(): func(_ context.Context, event *fsm.Event) {
 				app := event.Args[0].(*Application) //nolint:errcheck
@@ -480,7 +484,7 @@ func newAppState() *fsm.FSM { //nolint:funlen
 					return
 				}
 				reason := eventArgs[0]
-				app.handleRejectApplicationEvent(reason)
+				app.handleRejectApplicationEvent(reason) // +checklocksignore
 			},
 			CompleteApplication.String(): func(_ context.Context, event *fsm.Event) {
 				app := event.Args[0].(*Application) //nolint:errcheck
@@ -495,11 +499,11 @@ func newAppState() *fsm.FSM { //nolint:funlen
 					return
 				}
 				errMsg := eventArgs[0]
-				app.handleFailApplicationEvent(errMsg)
+				app.handleFailApplicationEvent(errMsg) // +checklocksignore
 			},
 			UpdateReservation.String(): func(_ context.Context, event *fsm.Event) {
 				app := event.Args[0].(*Application) //nolint:errcheck
-				app.onReservationStateChange()
+				app.onReservationStateChange()      // +checklocksignore
 			},
 			ReleaseAppAllocation.String(): func(_ context.Context, event *fsm.Event) {
 				app := event.Args[0].(*Application) //nolint:errcheck
@@ -511,11 +515,11 @@ func newAppState() *fsm.FSM { //nolint:funlen
 				}
 				taskID := eventArgs[0]
 				terminationType := eventArgs[1]
-				app.handleReleaseAppAllocationEvent(taskID, terminationType)
+				app.handleReleaseAppAllocationEvent(taskID, terminationType) // +checklocksignore
 			},
 			AppTaskCompleted.String(): func(_ context.Context, event *fsm.Event) {
 				app := event.Args[0].(*Application) //nolint:errcheck
-				app.handleAppTaskCompletedEvent()
+				app.handleAppTaskCompletedEvent()   // +checklocksignore
 			},
 		},
 	)
