@@ -525,6 +525,12 @@ func (app *Application) onReserving() {
 			"CreatingPlaceholders", "Application %s creating placeholders", app.applicationID)
 	}
 
+	// the routine below outlives this call and the application lock the caller holds over it, so
+	// it cannot read the originating task itself: that read would race with setOriginatingTask.
+	// Capture it here, where the lock is held, and report against the task the reservation
+	// started with.
+	originatingTask := app.originatingTask
+
 	go func() {
 		// while doing reserving
 		if err := getPlaceholderManager().createAppPlaceholders(app); err != nil {
@@ -534,8 +540,8 @@ func (app *Application) onReserving() {
 			ev := NewRunApplicationEvent(app.applicationID)
 			dispatcher.Dispatch(ev)
 			// failed at least one placeholder creation progress as a normal application
-			if app.originatingTask != nil {
-				events.GetRecorder().Eventf(app.originatingTask.GetTaskPod().DeepCopy(), nil, v1.EventTypeWarning, "GangScheduling",
+			if originatingTask != nil {
+				events.GetRecorder().Eventf(originatingTask.GetTaskPod().DeepCopy(), nil, v1.EventTypeWarning, "GangScheduling",
 					"PlaceholderCreateFailed", "Application %s fall back to normal scheduling", app.applicationID)
 			}
 		}
