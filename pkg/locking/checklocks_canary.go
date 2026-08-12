@@ -28,15 +28,16 @@ import "fmt"
 // analysed even when a build constraint excludes them, so the target can hand this file to
 // the analysis without it ever becoming part of the shim.
 //
-// The fixture holds one violation of each annotation class that is in use: setValue writes
-// a guarded field without holding the lock and reEnter calls a method that must not be
-// called with the lock held while holding it. The self test asserts that the analysis
-// reports both. Without that assertion checklocks could silently stop finding anything at
-// all and every run would still be green: the lock wrappers are recognised by their name,
-// so renaming them, changing the forwarding methods or moving to a gvisor version that
-// behaves differently all end in an analysis that reports nothing. The fixture uses the
-// wrappers of this package, which makes the self test cover the whole chain: wrapper type,
-// forwarding methods, field annotation and lock precondition.
+// The fixture holds a violation of each class that is in use: setValue writes
+// a guarded field without holding the lock, reEnter calls a method that must not be called
+// with the lock held while holding it, and doubleLock takes one lock twice. The self test
+// asserts that the analysis reports all three. Without that assertion checklocks could
+// silently stop finding anything at all and every run would still be green: the lock
+// wrappers are recognised by their declaration in locking.go, so removing it, renaming the
+// types, changing the forwarding methods or moving to a version that behaves differently
+// all end in an analysis that reports less than it did. The fixture uses the wrappers of
+// this package, which makes the self test cover the whole chain: wrapper type, forwarding
+// methods, field annotation and lock precondition.
 
 // +lockclass:canary.Canary
 type canary struct {
@@ -78,6 +79,33 @@ func (c *canary) reEnter(value int) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	c.setValueSelfLocking(value)
+}
+
+// relock takes and releases the lock twice over, which is balanced. It must never be reported.
+func (c *canary) relock(value int) {
+	c.lock.Lock()
+	c.value = value
+	c.lock.Unlock()
+	c.lock.Lock()
+	c.value = value
+	c.lock.Unlock()
+}
+
+// doubleLock takes the lock a second time on the same path, the self deadlock shape at its
+// simplest. The self test in the Makefile requires the analysis to report "already locked"
+// for this line.
+//
+// The diagnostic only exists while the wrappers declare themselves lock primitives. Without
+// that declaration the forwarding methods need a "+checklocksignore" each, and an ignore is
+// read at every call site of the function that carries it, so the whole class disappears for
+// every wrapper lock in the shim while every other message of this fixture stays exactly as
+// it is. The order analysis sees the same line as a nesting of two locks of one class; that
+// is silenced so nestSameClass stays the only source of that diagnostic.
+func (c *canary) doubleLock(value int) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.lock.Lock() // +lockorderignore
+	c.value = value
 }
 
 // nestSameClass locks two canaries at once. Two locks of one class must not nest, which the

@@ -34,11 +34,17 @@ package locking
 // the locking.Mutex and locking.RWMutex fields directly. When the inner lock is called
 // directly the analysis attributes the acquisition to the inner field, i.e. "lock.mu"
 // instead of "lock", and all "+checklocks:" field annotations fail to match. The forwarders
-// are ignored by the analysis: a lock method acquires a lock and returns while holding it,
-// which is exactly what its lock balance check flags. The ignore is not entirely free, it
-// also suppresses the "already locked" and "unlock without lock" diagnostics at every call
-// site. The lock state tracking itself is unaffected: guarded field access, the lock
-// preconditions of a function and the lock balance of the calling function are all still
+// need nothing of their own from the analysis: the wrapper types declare themselves lock
+// primitives (see locking.go), so a call to one is intercepted at the call site exactly as a
+// call to the inner lock would be and the body is not analysed, a lock implementation not
+// being a critical section. Until that declaration existed every forwarder carried a
+// "+checklocksignore" instead, because a lock method acquires a lock and returns while
+// holding it, which is exactly what the lock balance check flags. Those ignores are gone, and
+// with them the checking they cost: an ignore is read at every call site of the function that
+// carries it, so one per forwarder suppressed the "already locked" and "unlock without lock"
+// diagnostics for every wrapper lock in the code base. That class is checked again. The rest
+// of the lock state tracking never depended on this: guarded field access, the lock
+// preconditions of a function and the lock balance of the calling function were all still
 // checked.
 //
 // The forwarding costs nothing at runtime, the methods are inlined. The only visible effect
@@ -50,7 +56,6 @@ package locking
 // DEADLOCK_CLASS_ORDER_ENABLED is on, and the body is a call so these copies do not inline. That
 // is why the default build in forwarders.go carries the plain versions.
 
-// +checklocksignore
 func (m *Mutex) Lock() {
 	if classOrderEnabled.Load() {
 		m.enterClass()
@@ -58,7 +63,6 @@ func (m *Mutex) Lock() {
 	m.mu.Lock()
 }
 
-// +checklocksignore
 func (m *Mutex) Unlock() {
 	if classOrderEnabled.Load() {
 		m.leaveClass()
@@ -66,7 +70,6 @@ func (m *Mutex) Unlock() {
 	m.mu.Unlock()
 }
 
-// +checklocksignore
 func (m *RWMutex) Lock() {
 	if classOrderEnabled.Load() {
 		m.enterClass()
@@ -74,7 +77,6 @@ func (m *RWMutex) Lock() {
 	m.mu.Lock()
 }
 
-// +checklocksignore
 func (m *RWMutex) Unlock() {
 	if classOrderEnabled.Load() {
 		m.leaveClass()
@@ -82,7 +84,6 @@ func (m *RWMutex) Unlock() {
 	m.mu.Unlock()
 }
 
-// +checklocksignore
 func (m *RWMutex) RLock() {
 	if classOrderEnabled.Load() {
 		m.enterClass()
@@ -90,7 +91,6 @@ func (m *RWMutex) RLock() {
 	m.mu.RLock()
 }
 
-// +checklocksignore
 func (m *RWMutex) RUnlock() {
 	if classOrderEnabled.Load() {
 		m.leaveClass()
