@@ -387,7 +387,7 @@ lint: $(GOLANGCI_LINT_BIN)
 # same precondition reached from inside a callback, which is only reported while a guard can
 # name a value the body recovers by a type assertion, as the fsm callbacks in pkg/cache do,
 # and the two that no annotation states any more, an exclusion derived from the body and a
-# guard the structure declares for its fields, which 177 deleted annotations now rest on.
+# guard the structure declares for its fields, which 179 deleted annotations now rest on.
 CHECKLOCKS_ANALYZERS := -checklocks -lockorder -lockstringer -lockblocking -checklocks.inferred=false
 CHECKLOCKS_PACKAGES := $(REPO)/...
 checklocks: $(CHECKLOCKS_BIN)

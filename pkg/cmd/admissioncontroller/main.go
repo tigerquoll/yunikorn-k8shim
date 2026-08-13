@@ -145,8 +145,6 @@ func CreateWebhook(ac *admission.AdmissionController, port int) *WebHook {
 	}
 }
 
-// Stated, not derived: a closure captures the receiver, hiding the acquisition from the derivation.
-// +checklocksexclude:wh.Mutex
 func (wh *WebHook) Startup(certs *tls.Certificate) {
 	wh.Lock()
 	defer wh.Unlock()

@@ -43,7 +43,7 @@ import "fmt"
 // Two more classes are here for a different reason: nothing in the shim states them any more.
 // The exclusion of a method that takes its own lock is derived from the body, and a structure
 // states the guard for its fields once instead of once per field, and between them they let
-// 177 hand written annotations be deleted. An analyser that stopped deriving either would
+// 179 hand written annotations be deleted. An analyser that stopped deriving either would
 // take that protection with it and leave every other message of this fixture intact, so both
 // are required by name: see derivedReentrantCall and structGuardViolation below.
 
