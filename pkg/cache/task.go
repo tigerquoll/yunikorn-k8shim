@@ -39,26 +39,35 @@ import (
 	"github.com/apache/yunikorn-scheduler-interface/lib/go/si"
 )
 
+// +lockclass:cache.Task
 type Task struct {
 	taskID        string
 	alias         string
 	applicationID string
 	application   *Application
-	podStatus     v1.PodStatus // pod status, maintained separately for efficiency reasons
-	context       *Context
-	createTime    time.Time
-	placeholder   bool
-	originator    bool
-	sm            *fsm.FSM
+	// +checklocks:lock
+	podStatus   v1.PodStatus // pod status, maintained separately for efficiency reasons
+	context     *Context
+	createTime  time.Time
+	placeholder bool
+	originator  bool
+	sm          *fsm.FSM
 
 	// mutable resources, require locking
-	allocationKey   string
-	nodeName        string
-	taskGroupName   string
+	// +checklocks:lock
+	allocationKey string
+	// +checklocks:lock
+	nodeName string
+	// +checklocks:lock
+	taskGroupName string
+	// +checklocks:lock
 	terminationType string
+	// +checklocks:lock
 	schedulingState TaskSchedulingState
-	resource        *si.Resource
-	pod             *v1.Pod
+	// +checklocks:lock
+	resource *si.Resource
+	// +checklocks:lock
+	pod *v1.Pod
 
 	lock *locking.RWMutex
 }
@@ -230,6 +239,7 @@ func (task *Task) IsOriginator() bool {
 	return task.originator
 }
 
+// +checklocksread:task.lock
 func (task *Task) isPreemptSelfAllowed() bool {
 	value := utils.GetPodAnnotationValue(task.pod, constants.AnnotationAllowPreemption)
 	switch value {
@@ -242,6 +252,7 @@ func (task *Task) isPreemptSelfAllowed() bool {
 	}
 }
 
+// +checklocksread:task.lock
 func (task *Task) isPreemptOtherAllowed() bool {
 	policy := task.pod.Spec.PreemptionPolicy
 	if policy == nil {
@@ -285,6 +296,7 @@ func (task *Task) GetTaskSchedulingState() TaskSchedulingState {
 	return task.schedulingState
 }
 
+// +checklocks:task.lock
 func (task *Task) handleSubmitTaskEvent() {
 	log.Log(log.ShimCacheTask).Debug("scheduling pod",
 		zap.String("podName", task.pod.Name))
@@ -308,6 +320,7 @@ func (task *Task) handleSubmitTaskEvent() {
 
 // updateAllocation updates the core scheduler when task information changes.
 // This function must be called with the task lock held.
+// +checklocks:task.lock
 func (task *Task) updateAllocation() {
 	// build preemption policy
 	preemptionPolicy := &si.PreemptionPolicy{
@@ -392,6 +405,7 @@ func (task *Task) postTaskAllocated() {
 // If we find the task is already in Completed state while handling TaskAllocated
 // event, we need to explicitly release this allocation because it is no
 // longer valid.
+// +checklocks:task.lock
 func (task *Task) beforeTaskAllocated(eventSrc string, allocationKey string, nodeID string) {
 	// task is allocated on a node with a allocationKey set the details in the task here to allow referencing later.
 	task.allocationKey = allocationKey
@@ -408,6 +422,7 @@ func (task *Task) beforeTaskAllocated(eventSrc string, allocationKey string, nod
 	}
 }
 
+// +checklocksread:task.lock
 func (task *Task) postTaskBound() {
 	if task.placeholder {
 		log.Log(log.ShimCacheTask).Info("placeholder is bound",
@@ -418,6 +433,7 @@ func (task *Task) postTaskBound() {
 	}
 }
 
+// +checklocksread:task.lock
 func (task *Task) postTaskRejected() {
 	// currently, once task is rejected by scheduler, we directly move task to failed state.
 	// so this function simply triggers the state transition when it is rejected.
@@ -432,6 +448,7 @@ func (task *Task) postTaskRejected() {
 // beforeTaskFail releases the allocation or ask from scheduler core
 // this is done as a before hook because the releaseAllocation() call needs to
 // send different requests to scheduler-core, depending on current task state
+// +checklocks:task.lock
 func (task *Task) beforeTaskFail() {
 	events.GetRecorder().Eventf(task.pod.DeepCopy(), nil,
 		v1.EventTypeNormal, "TaskFailed", "TaskFailed",
@@ -442,6 +459,7 @@ func (task *Task) beforeTaskFail() {
 // beforeTaskCompleted releases the allocation or ask from scheduler core
 // this is done as a before hook because the releaseAllocation() call needs to
 // send different requests to scheduler-core, depending on current task state
+// +checklocks:task.lock
 func (task *Task) beforeTaskCompleted() {
 	task.releaseAllocation(false)
 
@@ -451,6 +469,7 @@ func (task *Task) beforeTaskCompleted() {
 }
 
 // releaseAllocation sends the release request for the Allocation to the core.
+// +checklocks:task.lock
 func (task *Task) releaseAllocation(force bool) {
 	terminationType := common.GetTerminationTypeFromString(task.terminationType)
 
@@ -505,6 +524,8 @@ func (task *Task) releaseAllocation(force bool) {
 	}
 }
 
+// YUNIKORN-XXXX: unlock-relock gap drops caller's lock mid-critical-section; restructure.
+// +checklocksignore
 func (task *Task) shouldAppRelease() bool {
 	task.lock.Unlock()
 	defer task.lock.Lock()
@@ -519,6 +540,7 @@ func (task *Task) sanityCheckBeforeScheduling() error {
 }
 
 // throw a warning if the pod has inconsistent metadata
+// +checklocksread:task.lock
 func (task *Task) checkPodMetadataBeforeScheduling() {
 	appID := utils.GetApplicationIDFromPod(task.pod)
 	ignoredAppIDLabels, ignoredAppIDAnnotation := utils.GetIgnoredLabelAnnotationInPod(task.pod, appID, constants.AppIdLabelKeys, constants.AppIdAnnotationKeys)
@@ -533,6 +555,7 @@ func (task *Task) checkPodMetadataBeforeScheduling() {
 	}
 }
 
+// +checklocksread:task.lock
 func (task *Task) logIgnoredPodMetadata(metadataType string, fianlValue string, ignoredLabel map[string]string, ignoredAnnotation map[string]string) {
 	ignoredItems := make([]string, 0)
 	for key, value := range ignoredLabel {
@@ -614,6 +637,7 @@ func (task *Task) FailWithEvent(errorMessage, actionReason string) {
 	task.failWithEvent(errorMessage, actionReason)
 }
 
+// +checklocksread:task.lock
 func (task *Task) failWithEvent(errorMessage, actionReason string) {
 	events.GetRecorder().Eventf(task.pod.DeepCopy(),
 		nil, v1.EventTypeWarning, actionReason, actionReason, errorMessage)
