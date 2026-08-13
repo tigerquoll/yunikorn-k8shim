@@ -382,8 +382,10 @@ lint: $(GOLANGCI_LINT_BIN)
 # The run starts with a self test on a fixture that must be reported, see the canary file
 # in pkg/locking: an analysis that reports nothing at all would pass this target silently.
 # The fixture carries at least one violation per analysis and every one of them has to show up
-# in its output. checklocks has three: the guarded field, the lock precondition, and the lock
-# taken twice, which is only reported while the wrappers declare themselves lock primitives.
+# in its output. checklocks has four: the guarded field, the lock precondition, the lock taken
+# twice, which is only reported while the wrappers declare themselves lock primitives, and the
+# same precondition reached from inside a callback, which is only reported while a guard can
+# name a value the body recovers by a type assertion, as the fsm callbacks in pkg/cache do.
 CHECKLOCKS_ANALYZERS := -checklocks -lockorder -lockstringer -lockblocking -checklocks.inferred=false
 CHECKLOCKS_PACKAGES := $(REPO)/...
 checklocks: $(CHECKLOCKS_BIN)
@@ -394,7 +396,7 @@ checklocks: $(CHECKLOCKS_BIN)
 	out=$$("$(GO)" vet "-vettool=$(BASE_DIR)/$(CHECKLOCKS_BIN)" $(CHECKLOCKS_ANALYZERS) $$files "$$canary" 2>&1) ; \
 	status=$$? ; \
 	missing="" ; \
-	for want in "invalid field access" "must not hold" "already locked" "must not nest" "guarded read races" "a wait under a lock stalls" ; do \
+	for want in "invalid field access" "must not hold" "already locked" "to call callbackSelfLocking" "must not nest" "guarded read races" "a wait under a lock stalls" ; do \
 		printf '%s\n' "$$out" | grep -q "$$want" || missing="$$missing\n  $$want" ; \
 	done ; \
 	if [ $$status -eq 0 ] || [ -n "$$missing" ] ; then \

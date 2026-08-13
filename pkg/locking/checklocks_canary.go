@@ -30,8 +30,9 @@ import "fmt"
 //
 // The fixture holds a violation of each class that is in use: setValue writes
 // a guarded field without holding the lock, reEnter calls a method that must not be called
-// with the lock held while holding it, and doubleLock takes one lock twice. The self test
-// asserts that the analysis reports all three. Without that assertion checklocks could
+// with the lock held while holding it, doubleLock takes one lock twice, and the callback
+// table reaches the second of those from a body whose lock is named by the value it asserts.
+// The self test asserts that the analysis reports all four. Without that assertion checklocks could
 // silently stop finding anything at all and every run would still be green: the lock
 // wrappers are recognised by their declaration in locking.go, so removing it, renaming the
 // types, changing the forwarding methods or moving to a version that behaves differently
@@ -106,6 +107,52 @@ func (c *canary) doubleLock(value int) {
 	defer c.lock.Unlock()
 	c.lock.Lock() // +lockorderignore
 	c.value = value
+}
+
+// callbackCanary is the subject of the callback fixture below. Its guarded field is named
+// apart from the one above so a diagnostic about it can only have come from there. It carries
+// no lock class: the order analysis has its own fixture and should not see this one.
+type callbackCanary struct {
+	lock RWMutex
+	// +checklocks:lock
+	callbackValue int
+}
+
+// callbackSelfLocking takes the subject's own lock, so holding it on entry would deadlock.
+// +checklocksexclude:c.lock
+func (c *callbackCanary) callbackSelfLocking(value int) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.callbackValue = value
+}
+
+// callbackEvent stands in for what a state machine library hands a callback: the subject
+// arrives inside an interface and the body recovers it by asserting a type.
+type callbackEvent struct {
+	Args []any
+}
+
+// callbackTable is the shape the fsm callbacks in pkg/cache have: a table of literals handed
+// to a library, each stating the lock its caller holds by naming the value its own body
+// recovers, because that value exists nowhere else to be named.
+//
+// Both polarities are in the one literal. The write through the asserted subject is correct
+// and must never be reported, and the call below it must be, because the guard put that
+// subject's lock in scope and the callee takes it again.
+//
+// The second is what the self test requires, and it is the only message here that a guard
+// which stopped binding would take with it: a guard matching nothing records no lock,
+// silently, and then the call is fine while the write is reported instead. Requiring the
+// report on the WRITE would pass in both worlds and prove nothing.
+func callbackTable() map[string]func(*callbackEvent) {
+	return map[string]func(*callbackEvent){
+		// +checklocks:event.Args[0].(*callbackCanary).lock
+		"enter": func(event *callbackEvent) {
+			subject := event.Args[0].(*callbackCanary)
+			subject.callbackValue = 1
+			subject.callbackSelfLocking(2)
+		},
+	}
 }
 
 // nestSameClass locks two canaries at once. Two locks of one class must not nest, which the
