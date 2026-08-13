@@ -53,7 +53,6 @@ func NewPriorityClassCache(priorityClasses informersv1.PriorityClassInformer) (*
 }
 
 // isPreemptSelfAllowed returns the preemption value. Only returns false if configured.
-// +checklocksexcludewrite:pcc.RWMutex
 func (pcc *PriorityClassCache) isPreemptSelfAllowed(priorityClassName string) bool {
 	pcc.RLock()
 	defer pcc.RUnlock()
@@ -66,7 +65,6 @@ func (pcc *PriorityClassCache) isPreemptSelfAllowed(priorityClassName string) bo
 }
 
 // priorityClassExists for test only to see if the PriorityClass has been added to the cache or not.
-// +checklocksexcludewrite:pcc.RWMutex
 func (pcc *PriorityClassCache) priorityClassExists(priorityClassName string) bool {
 	pcc.RLock()
 	defer pcc.RUnlock()

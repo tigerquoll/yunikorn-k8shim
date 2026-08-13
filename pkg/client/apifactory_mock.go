@@ -207,7 +207,6 @@ func (m *MockedAPIProvider) IsTestingMode() bool {
 	return true
 }
 
-// +checklocksexclude:m.Mutex
 func (m *MockedAPIProvider) AddEventHandler(handlers *ResourceEventHandlers) error {
 	m.Lock()
 	defer m.Unlock()
@@ -222,6 +221,7 @@ func (m *MockedAPIProvider) AddEventHandler(handlers *ResourceEventHandlers) err
 	return nil
 }
 
+// Stated, not derived: a closure captures the receiver, hiding the acquisition from the derivation.
 // +checklocksexclude:m.Mutex
 func (m *MockedAPIProvider) RunEventHandler() {
 	m.Lock()
@@ -289,7 +289,6 @@ func (m *MockedAPIProvider) Start() {
 	// no impl
 }
 
-// +checklocksexclude:m.Mutex
 func (m *MockedAPIProvider) Stop() {
 	m.Lock()
 	defer m.Unlock()

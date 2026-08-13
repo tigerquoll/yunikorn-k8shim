@@ -124,7 +124,6 @@ func createTaskInternal(tid string, app *Application, resource *si.Resource,
 }
 
 // event handling
-// +checklocksexclude:task.lock
 func (task *Task) handle(te events.TaskEvent) error {
 	task.lock.Lock()
 	defer task.lock.Unlock()
@@ -136,14 +135,12 @@ func (task *Task) handle(te events.TaskEvent) error {
 	return nil
 }
 
-// +checklocksexcludewrite:task.lock
 func (task *Task) canHandle(te events.TaskEvent) bool {
 	task.lock.RLock()
 	defer task.lock.RUnlock()
 	return task.sm.Can(te.GetEvent())
 }
 
-// +checklocksexcludewrite:task.lock
 func (task *Task) GetTaskPod() *v1.Pod {
 	task.lock.RLock()
 	defer task.lock.RUnlock()
@@ -163,42 +160,36 @@ func (task *Task) GetTaskState() string {
 	return task.sm.Current()
 }
 
-// +checklocksexclude:task.lock
 func (task *Task) setTaskGroupName(groupName string) {
 	task.lock.Lock()
 	defer task.lock.Unlock()
 	task.taskGroupName = groupName
 }
 
-// +checklocksexclude:task.lock
 func (task *Task) setTaskTerminationType(terminationType string) {
 	task.lock.Lock()
 	defer task.lock.Unlock()
 	task.terminationType = terminationType
 }
 
-// +checklocksexcludewrite:task.lock
 func (task *Task) GetTaskTerminationType() string {
 	task.lock.RLock()
 	defer task.lock.RUnlock()
 	return task.terminationType
 }
 
-// +checklocksexcludewrite:task.lock
 func (task *Task) GetTaskGroupName() string {
 	task.lock.RLock()
 	defer task.lock.RUnlock()
 	return task.taskGroupName
 }
 
-// +checklocksexcludewrite:task.lock
 func (task *Task) GetNodeName() string {
 	task.lock.RLock()
 	defer task.lock.RUnlock()
 	return task.nodeName
 }
 
-// +checklocksexcludewrite:task.lock
 func (task *Task) DeleteTaskPod() error {
 	return task.context.apiProvider.GetAPIs().KubeClient.Delete(task.GetTaskPod())
 }
@@ -225,7 +216,6 @@ func (task *Task) isTerminated() bool {
 // but during scheduler init after restart, we need to init the task state according to
 // the task pod status. if the pod is already terminated,
 // we should mark the task as completed according.
-// +checklocksexclude:task.lock
 func (task *Task) initialize() {
 	task.lock.Lock()
 	defer task.lock.Unlock()
@@ -279,14 +269,12 @@ func (task *Task) isPreemptOtherAllowed() bool {
 	}
 }
 
-// +checklocksexclude:task.lock
 func (task *Task) SetTaskSchedulingState(state TaskSchedulingState) {
 	task.lock.Lock()
 	defer task.lock.Unlock()
 	task.schedulingState = state
 }
 
-// +checklocksexclude:task.lock
 func (task *Task) MarkPreviouslyAllocated(allocationKey string, nodeID string) {
 	task.sm.SetState(TaskStates().Bound)
 	task.lock.Lock()
@@ -303,7 +291,6 @@ func (task *Task) MarkPreviouslyAllocated(allocationKey string, nodeID string) {
 	}
 }
 
-// +checklocksexcludewrite:task.lock
 func (task *Task) GetTaskSchedulingState() TaskSchedulingState {
 	task.lock.RLock()
 	defer task.lock.RUnlock()
@@ -586,7 +573,6 @@ func (task *Task) logIgnoredPodMetadata(metadataType string, fianlValue string, 
 		nil, v1.EventTypeWarning, "Scheduling", "Scheduling", logMessage)
 }
 
-// +checklocksexcludewrite:task.lock
 func (task *Task) checkPodPVCs() error {
 	task.lock.RLock()
 	// Check PVCs used by the pod
@@ -612,7 +598,6 @@ func (task *Task) checkPodPVCs() error {
 	return nil
 }
 
-// +checklocksexclude:task.lock
 func (task *Task) UpdatePodCondition(podCondition *v1.PodCondition) (bool, *v1.Pod) {
 	task.lock.Lock()
 	defer task.lock.Unlock()
@@ -635,21 +620,18 @@ func (task *Task) UpdatePodCondition(podCondition *v1.PodCondition) (bool, *v1.P
 	return false, pod
 }
 
-// +checklocksexcludewrite:task.lock
 func (task *Task) GetAllocationKey() string {
 	task.lock.RLock()
 	defer task.lock.RUnlock()
 	return task.allocationKey
 }
 
-// +checklocksexclude:task.lock
 func (task *Task) setAllocationKey(allocationKey string) {
 	task.lock.Lock()
 	defer task.lock.Unlock()
 	task.allocationKey = allocationKey
 }
 
-// +checklocksexcludewrite:task.lock
 func (task *Task) FailWithEvent(errorMessage, actionReason string) {
 	task.lock.RLock()
 	defer task.lock.RUnlock()
@@ -667,7 +649,6 @@ func (task *Task) failWithEvent(errorMessage, actionReason string) {
 // It resets task state and notifies the core to move the allocation back to a
 // pending ask so it can be re-scheduled on a different node.
 // Must be called without holding the task lock.
-// +checklocksexclude:task.lock
 func (task *Task) rollbackOnAssumePodFailure(allocationKey, nodeID string) {
 	// Read fields needed for event posting and release request.
 	// Clear stale node assignment under write lock so the task is clean for the next allocation.
@@ -713,7 +694,6 @@ func (task *Task) rollbackOnAssumePodFailure(allocationKey, nodeID string) {
 		zap.String("allocationKey", allocationKey))
 }
 
-// +checklocksexclude:task.lock
 func (task *Task) SetTaskPod(pod *v1.Pod) {
 	task.lock.Lock()
 	defer task.lock.Unlock()

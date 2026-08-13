@@ -39,6 +39,13 @@ import "fmt"
 // all end in an analysis that reports less than it did. The fixture uses the wrappers of
 // this package, which makes the self test cover the whole chain: wrapper type, forwarding
 // methods, field annotation and lock precondition.
+//
+// Two more classes are here for a different reason: nothing in the shim states them any more.
+// The exclusion of a method that takes its own lock is derived from the body, and a structure
+// states the guard for its fields once instead of once per field, and between them they let
+// 177 hand written annotations be deleted. An analyser that stopped deriving either would
+// take that protection with it and leave every other message of this fixture intact, so both
+// are required by name: see derivedReentrantCall and structGuardViolation below.
 
 // +lockclass:canary.Canary
 type canary struct {
@@ -107,6 +114,64 @@ func (c *canary) doubleLock(value int) {
 	defer c.lock.Unlock()
 	c.lock.Lock() // +lockorderignore
 	c.value = value
+}
+
+// derivedCanary is the subject of the derived exclusion fixture. Its lock and its field are
+// apart from the ones above so a diagnostic about either can only have come from here. It
+// carries no lock class: the order analysis has its own fixture and should not see this one.
+type derivedCanary struct {
+	lock         RWMutex
+	derivedValue int // +checklocks:lock
+}
+
+// derivedSelfLocking carries no exclusion annotation on purpose. It takes its own lock, which
+// is all the analysis needs to know that a caller holding that lock deadlocks, so the fact is
+// derived from this body. The hand written exclusions the shim used to carry on every method
+// of this shape were deleted on the strength of that derivation.
+func (d *derivedCanary) derivedSelfLocking(value int) {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	d.derivedValue = value
+}
+
+// derivedReentrantCall holds the lock over a call to a method that takes it. Nothing states
+// the exclusion, so the analysis must have derived it, and the self test requires the message
+// by the callee's name: the exclusions written by hand elsewhere in this fixture would keep it
+// green otherwise. Unlike reEnter this needs no order suppression, because the type above
+// carries no class for the order analysis to nest.
+func (d *derivedCanary) derivedReentrantCall(value int) {
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	d.derivedSelfLocking(value)
+}
+
+// structGuardCanary states the guard once, on the type, instead of once per field. Every field
+// is guarded by it except the ones opting out, which is how the shim caches are annotated since
+// the per field guards were collapsed.
+//
+// +checklocksguardedby:lock
+type structGuardCanary struct {
+	lock               RWMutex
+	structGuardedValue int
+	// +checklocksunguarded
+	structFixedValue int
+}
+
+// structGuardedWrite writes the guarded field with the lock held. It must never be reported.
+func (s *structGuardCanary) structGuardedWrite(value int) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.structGuardedValue = value
+}
+
+// structGuardViolation writes a field that carries no annotation of its own without the lock,
+// so it is only guarded while the annotation on the type expands to it. The self test requires
+// the message by the field's name. The second write must never be reported: an expansion that
+// ignored the opt out would report both, and requiring only the first message would pass in
+// that world too.
+func (s *structGuardCanary) structGuardViolation(value int) {
+	s.structGuardedValue = value
+	s.structFixedValue = value
 }
 
 // callbackCanary is the subject of the callback fixture below. Its guarded field is named

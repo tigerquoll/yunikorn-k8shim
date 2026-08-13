@@ -118,7 +118,6 @@ func newWebhookManagerImpl(conf *conf.AdmissionControllerConf, clientset kuberne
 	return wm
 }
 
-// +checklocksexclude:wm.RWMutex
 func (wm *webhookManagerImpl) LoadCACertificates() error {
 	attempts := 0
 	for {
@@ -136,7 +135,6 @@ func (wm *webhookManagerImpl) LoadCACertificates() error {
 	}
 }
 
-// +checklocksexcludewrite:wm.RWMutex
 func (wm *webhookManagerImpl) GenerateServerCertificate() (*tls.Certificate, error) {
 	caCert, caKey, err := wm.getBestCACertificate()
 	if err != nil {
@@ -193,7 +191,6 @@ func (wm *webhookManagerImpl) GenerateServerCertificate() (*tls.Certificate, err
 	return &pair, nil
 }
 
-// +checklocksexcludewrite:wm.RWMutex
 func (wm *webhookManagerImpl) InstallWebhooks() error {
 	attempts := 0
 	for {
@@ -232,20 +229,17 @@ func (wm *webhookManagerImpl) InstallWebhooks() error {
 	return nil
 }
 
-// +checklocksexcludewrite:wm.RWMutex
 func (wm *webhookManagerImpl) WaitForCertificateExpiration() {
 	renewTime := wm.getExpiration().AddDate(0, 0, -30)
 	time.Sleep(time.Until(renewTime))
 }
 
-// +checklocksexcludewrite:wm.RWMutex
 func (wm *webhookManagerImpl) getExpiration() time.Time {
 	wm.RLock()
 	defer wm.RUnlock()
 	return wm.expiration
 }
 
-// +checklocksexcludewrite:wm.RWMutex
 func (wm *webhookManagerImpl) installValidatingWebhook() (bool, error) {
 	log.Log(log.AdmissionWebhook).Info("Checking for existing validating webhook...")
 
@@ -319,7 +313,6 @@ func (wm *webhookManagerImpl) installValidatingWebhook() (bool, error) {
 	return true, nil
 }
 
-// +checklocksexcludewrite:wm.RWMutex
 func (wm *webhookManagerImpl) installMutatingWebhook() (bool, error) {
 	log.Log(log.AdmissionWebhook).Info("Checking for existing mutating webhook...")
 
@@ -547,7 +540,6 @@ func (wm *webhookManagerImpl) checkMutatingWebhook(webhook *v1.MutatingWebhookCo
 	return nil
 }
 
-// +checklocksexcludewrite:wm.RWMutex
 func (wm *webhookManagerImpl) validateCaBundle(bundle []byte) error {
 	wm.RLock()
 	defer wm.RUnlock()
@@ -570,7 +562,6 @@ func (wm *webhookManagerImpl) validateCaBundle(bundle []byte) error {
 	return nil
 }
 
-// +checklocksexcludewrite:wm.RWMutex
 func (wm *webhookManagerImpl) encodeCaBundle() ([]byte, error) {
 	wm.RLock()
 	defer wm.RUnlock()
@@ -659,7 +650,6 @@ func (wm *webhookManagerImpl) populateMutatingWebhook(webhook *v1.MutatingWebhoo
 }
 
 // gets the best certificate / private key pair to use (one with latest expiration)
-// +checklocksexcludewrite:wm.RWMutex
 func (wm *webhookManagerImpl) getBestCACertificate() (*x509.Certificate, *rsa.PrivateKey, error) {
 	wm.RLock()
 	defer wm.RUnlock()
@@ -674,7 +664,6 @@ func (wm *webhookManagerImpl) getBestCACertificate() (*x509.Certificate, *rsa.Pr
 	return wm.caCert1, wm.caKey1, nil
 }
 
-// +checklocksexclude:wm.RWMutex
 func (wm *webhookManagerImpl) loadCaCertificatesInternal() (bool, error) {
 	wm.Lock()
 	defer wm.Unlock()

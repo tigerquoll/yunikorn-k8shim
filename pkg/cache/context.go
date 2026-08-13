@@ -185,7 +185,6 @@ func (ctx *Context) addNode(obj interface{}) {
 	ctx.updateNode(nil, obj)
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) updateNode(_, obj interface{}) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -265,7 +264,6 @@ func (ctx *Context) updateNodeSchedulability(prevNode, node *v1.Node) error {
 	return ctx.apiProvider.GetAPIs().SchedulerAPI.UpdateNode(request)
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) deleteNode(obj interface{}) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -287,7 +285,6 @@ func (ctx *Context) deleteNode(obj interface{}) {
 	ctx.deleteNodeInternal(node)
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) addNodesWithoutRegistering(nodes []*v1.Node) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -321,12 +318,10 @@ func (ctx *Context) deleteNodeInternal(node *v1.Node) {
 	}
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) AddPod(obj interface{}) {
 	ctx.UpdatePod(nil, obj)
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) UpdatePod(oldObj, newObj interface{}) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -521,7 +516,6 @@ func (ctx *Context) DeletePod(obj interface{}) {
 	}
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) deleteYuniKornPod(pod *v1.Pod) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -533,7 +527,6 @@ func (ctx *Context) deleteYuniKornPod(pod *v1.Pod) {
 	ctx.schedulerCache.RemovePod(pod)
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) deleteForeignPod(pod *v1.Pod) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -629,7 +622,6 @@ func (ctx *Context) addPriorityClass(obj interface{}) {
 	ctx.updatePriorityClass(nil, obj)
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) updatePriorityClass(_, newObj interface{}) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -642,7 +634,6 @@ func (ctx *Context) updatePriorityClassInternal(priorityClass *schedulingv1.Prio
 	ctx.schedulerCache.UpdatePriorityClass(priorityClass)
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) deletePriorityClass(obj interface{}) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -692,7 +683,6 @@ func (ctx *Context) triggerReloadConfig(index int, configMap *v1.ConfigMap) {
 
 // setConfigMap sets the new config map object in the list of maps maintained in the context and returns a flat map
 // of the settings from both maps
-// +checklocksexclude:ctx.lock
 func (ctx *Context) setConfigMap(index int, configMap *v1.ConfigMap) map[string]string {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -711,7 +701,6 @@ func (ctx *Context) EventsToRegister(queueingHintFn fwk.QueueingHintFn) []fwk.Cl
 }
 
 // IsPodFitNode evaluates given predicates based on current context
-// +checklocksexcludewrite:ctx.lock
 func (ctx *Context) IsPodFitNode(name, node string, allocate bool) error {
 	ctx.lock.RLock()
 	defer ctx.lock.RUnlock()
@@ -734,7 +723,6 @@ func (ctx *Context) IsPodFitNode(name, node string, allocate bool) error {
 	return err
 }
 
-// +checklocksexcludewrite:ctx.lock
 func (ctx *Context) IsPodFitNodeViaPreemption(name, node string, allocations []string, startIndex int) (int, bool) {
 	ctx.lock.RLock()
 	defer ctx.lock.RUnlock()
@@ -845,7 +833,6 @@ func (ctx *Context) bindPodVolumes(pod *v1.Pod) error {
 // be running on it. And we keep this cache in-sync between core and the shim.
 // this way, the core can make allocation decisions with consideration of
 // other assumed pods before they are actually bound to the node (bound is slow).
-// +checklocksexclude:ctx.lock
 func (ctx *Context) AssumePod(name, node string) error {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -907,7 +894,6 @@ func (ctx *Context) AssumePod(name, node string) error {
 
 // forget pod must be called when a pod is assumed to be running on a node,
 // but then for some reason it is failed to bind or released.
-// +checklocksexclude:ctx.lock
 func (ctx *Context) ForgetPod(name string) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -922,7 +908,6 @@ func (ctx *Context) ForgetPod(name string) {
 // RevertPodVolumeAssumptions undoes any PV/PVC assumptions made by the volume binder
 // for the given pod on the given node. This is idempotent and safe to call even if
 // AssumePodVolumes was never called or already reverted internally.
-// +checklocksexclude:ctx.lock
 func (ctx *Context) RevertPodVolumeAssumptions(podName, nodeID string) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -1027,7 +1012,6 @@ func (ctx *Context) getNamespaceObject(namespace string) *v1.Namespace {
 	return namespaceObj
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) AddApplication(request *AddApplicationRequest) *Application {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -1090,7 +1074,6 @@ func (ctx *Context) IsPreemptSelfAllowed(priorityClassName string) bool {
 	return true
 }
 
-// +checklocksexcludewrite:ctx.lock
 func (ctx *Context) GetApplication(appID string) *Application {
 	ctx.lock.RLock()
 	defer ctx.lock.RUnlock()
@@ -1105,7 +1088,6 @@ func (ctx *Context) getApplication(appID string) *Application {
 	return nil
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) RemoveApplication(appID string) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -1122,7 +1104,6 @@ func (ctx *Context) removeApplication(appID string) {
 }
 
 // this implements ApplicationManagementProtocol
-// +checklocksexclude:ctx.lock
 func (ctx *Context) AddTask(request *AddTaskRequest) *Task {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -1174,7 +1155,6 @@ func (ctx *Context) addTask(request *AddTaskRequest) *Task {
 	return nil
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) RemoveTask(appID, taskID string) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
@@ -1186,7 +1166,6 @@ func (ctx *Context) RemoveTask(appID, taskID string) {
 	app.RemoveTask(taskID)
 }
 
-// +checklocksexcludewrite:ctx.lock
 func (ctx *Context) getTask(appID string, taskID string) *Task {
 	ctx.lock.RLock()
 	defer ctx.lock.RUnlock()
@@ -1206,7 +1185,6 @@ func (ctx *Context) getTask(appID string, taskID string) *Task {
 	return task
 }
 
-// +checklocksexcludewrite:ctx.lock
 func (ctx *Context) GetAllApplications() []*Application {
 	ctx.lock.RLock()
 	defer ctx.lock.RUnlock()
@@ -1443,7 +1421,6 @@ func (ctx *Context) GetSchedulerCache() *schedulercache.SchedulerCache {
 
 // InitializeState is used to initialize the state of the scheduler context using the Kubernetes informers.
 // This registers priority classes, nodes, and pods and ensures the scheduler core is synchronized.
-// +checklocksexclude:ctx.lock
 func (ctx *Context) InitializeState() error {
 	// Step 1: Register priority classes. This is first so that we can rely on the information they
 	// provide to properly register tasks with correct priority and preemption metadata.
@@ -1581,7 +1558,6 @@ func (ctx *Context) registerNode(node *v1.Node) error {
 	return nil
 }
 
-// +checklocksexclude:ctx.lock
 func (ctx *Context) RegisterNodes(nodes []*v1.Node) ([]*v1.Node, error) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()

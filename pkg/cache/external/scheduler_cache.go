@@ -41,31 +41,24 @@ import (
 // Nodes are cached in the form of de-scheduler nodeInfo. Instead of re-creating all nodes info from scratch,
 // we replicate nodes info from de-scheduler, in order to re-use predicates functions.
 // +lockclass:external.SchedulerCache
+// +checklocksguardedby:lock
 type SchedulerCache struct {
-	// +checklocks:lock
-	nodesMap map[string]*framework.NodeInfo // node name to NodeInfo map
-	// +checklocks:lock
-	podsMap map[string]*v1.Pod
-	// +checklocks:lock
-	pcMap map[string]*schedulingv1.PriorityClass
-	// +checklocks:lock
-	assignedPods map[string]string // map of pods to the node they are currently assigned to
-	// +checklocks:lock
-	assumedPods map[string]bool // map of assumed pods, value indicates if pod volumes are all bound
-	// +checklocks:lock
+	nodesMap     map[string]*framework.NodeInfo // node name to NodeInfo map
+	podsMap      map[string]*v1.Pod
+	pcMap        map[string]*schedulingv1.PriorityClass
+	assignedPods map[string]string  // map of pods to the node they are currently assigned to
+	assumedPods  map[string]bool    // map of assumed pods, value indicates if pod volumes are all bound
 	orphanedPods map[string]*v1.Pod // map of orphaned pods, keyed by pod UID
-	// +checklocks:lock
 	pvcRefCounts map[string]map[string]int
 	lock         locking.RWMutex
-	clients      *client.Clients // client APIs
-	klogger      klog.Logger
+	// +checklocksunguarded
+	clients *client.Clients // client APIs
+	// +checklocksunguarded
+	klogger klog.Logger
 
 	// cached data, re-calculated on demand from nodesMap
-	// +checklocks:lock
-	nodesInfo []fwk.NodeInfo
-	// +checklocks:lock
-	nodesInfoPodsWithAffinity []fwk.NodeInfo
-	// +checklocks:lock
+	nodesInfo                        []fwk.NodeInfo
+	nodesInfoPodsWithAffinity        []fwk.NodeInfo
 	nodesInfoPodsWithReqAntiAffinity []fwk.NodeInfo
 }
 
@@ -156,6 +149,9 @@ func (cache *SchedulerCache) GetNodesInfoPodsWithReqAntiAffinity() []fwk.NodeInf
 // exclude the lock instead of only excluding a write hold: this is the one cache in the
 // shim that hands its read lock to its callers, so a read hold is a state code can really
 // be in, and taking the lock again from there is the recursive read lock above.
+// None of these exclusions is derived. This one names a lock the method is declared to hand
+// on, which is not one it acquires, and the rest take the read lock, which would be derived
+// as an exclusion of a writer alone: the wider rule is the one meant, so it is written.
 // +checklocksacquireread:cache.lock
 // +checklocksexclude:cache.lock
 func (cache *SchedulerCache) LockForReads() {
@@ -178,7 +174,6 @@ func (cache *SchedulerCache) GetNode(name string) *framework.NodeInfo {
 }
 
 // UpdateNode updates the given node in the cache and returns the previous node if it exists
-// +checklocksexclude:cache.lock
 func (cache *SchedulerCache) UpdateNode(node *v1.Node) (*v1.Node, []*v1.Pod) {
 	cache.lock.Lock()
 	defer cache.lock.Unlock()
@@ -221,7 +216,6 @@ func (cache *SchedulerCache) updateNode(node *v1.Node) (*v1.Node, []*v1.Pod) {
 	return prevNode, adopted
 }
 
-// +checklocksexclude:cache.lock
 func (cache *SchedulerCache) RemoveNode(node *v1.Node) (*v1.Node, []*v1.Pod) {
 	cache.lock.Lock()
 	defer cache.lock.Unlock()
@@ -271,7 +265,6 @@ func (cache *SchedulerCache) GetPriorityClass(name string) *schedulingv1.Priorit
 	return nil
 }
 
-// +checklocksexclude:cache.lock
 func (cache *SchedulerCache) UpdatePriorityClass(priorityClass *schedulingv1.PriorityClass) {
 	cache.lock.Lock()
 	defer cache.lock.Unlock()
@@ -292,7 +285,6 @@ func (cache *SchedulerCache) updatePriorityClass(priorityClass *schedulingv1.Pri
 	cache.pcMap[priorityClass.Name] = priorityClass
 }
 
-// +checklocksexclude:cache.lock
 func (cache *SchedulerCache) RemovePriorityClass(priorityClass *schedulingv1.PriorityClass) {
 	cache.lock.Lock()
 	defer cache.lock.Unlock()
@@ -330,7 +322,6 @@ func (cache *SchedulerCache) ArePodVolumesAllBound(podKey string) bool {
 }
 
 // UpdatePod updates a pod in the cache
-// +checklocksexclude:cache.lock
 func (cache *SchedulerCache) UpdatePod(newPod *v1.Pod) bool {
 	cache.lock.Lock()
 	defer cache.lock.Unlock()
@@ -420,7 +411,6 @@ func (cache *SchedulerCache) updatePod(pod *v1.Pod) bool {
 }
 
 // RemovePod removes a pod from the cache
-// +checklocksexclude:cache.lock
 func (cache *SchedulerCache) RemovePod(pod *v1.Pod) {
 	cache.lock.Lock()
 	defer cache.lock.Unlock()
@@ -477,7 +467,6 @@ func (cache *SchedulerCache) GetPodNoLock(uid string) *v1.Pod {
 	return nil
 }
 
-// +checklocksexclude:cache.lock
 func (cache *SchedulerCache) AssumePod(pod *v1.Pod, allBound bool) {
 	cache.lock.Lock()
 	defer cache.lock.Unlock()
@@ -499,7 +488,6 @@ func (cache *SchedulerCache) assumePod(pod *v1.Pod, allBound bool) {
 	cache.assumedPods[key] = allBound
 }
 
-// +checklocksexclude:cache.lock
 func (cache *SchedulerCache) ForgetPod(pod *v1.Pod) {
 	cache.lock.Lock()
 	defer cache.lock.Unlock()

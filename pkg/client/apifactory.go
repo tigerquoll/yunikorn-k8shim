@@ -171,7 +171,6 @@ func (s *APIFactory) IsTestingMode() bool {
 	return s.testMode
 }
 
-// +checklocksexclude:s.lock
 func (s *APIFactory) AddEventHandler(handlers *ResourceEventHandlers) error {
 	s.lock.Lock()
 	defer s.lock.Unlock()

@@ -75,7 +75,6 @@ func getPlaceholderManager() *PlaceholderManager {
 	return placeholderMgr
 }
 
-// +checklocksexclude:mgr.RWMutex
 // +checklocksexclude:app.lock
 func (mgr *PlaceholderManager) createAppPlaceholders(app *Application) error {
 	mgr.Lock()
@@ -112,7 +111,6 @@ func (mgr *PlaceholderManager) createAppPlaceholders(app *Application) error {
 }
 
 // clean up all the placeholders for an application
-// +checklocksexclude:mgr.RWMutex
 // +checklocksexclude:app.lock
 func (mgr *PlaceholderManager) cleanUp(app *Application) {
 	mgr.Lock()
@@ -134,7 +132,6 @@ func (mgr *PlaceholderManager) cleanUp(app *Application) {
 		zap.String("appID", app.GetApplicationID()))
 }
 
-// +checklocksexclude:mgr.RWMutex
 func (mgr *PlaceholderManager) cleanOrphanPlaceholders() {
 	mgr.Lock()
 	defer mgr.Unlock()
@@ -190,21 +187,18 @@ func (mgr *PlaceholderManager) setRunning(flag bool) {
 	mgr.running.Store(flag)
 }
 
-// +checklocksexcludewrite:mgr.RWMutex
 func (mgr *PlaceholderManager) getOrphanPodsLength() int {
 	mgr.RLock()
 	defer mgr.RUnlock()
 	return len(mgr.orphanPods)
 }
 
-// +checklocksexclude:mgr.RWMutex
 func (mgr *PlaceholderManager) setCleanupTime(value time.Duration) {
 	mgr.Lock()
 	defer mgr.Unlock()
 	mgr.cleanupTime = value
 }
 
-// +checklocksexcludewrite:mgr.RWMutex
 func (mgr *PlaceholderManager) getCleanupTime() time.Duration {
 	mgr.RLock()
 	defer mgr.RUnlock()
