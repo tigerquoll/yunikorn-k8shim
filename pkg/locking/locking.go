@@ -16,6 +16,22 @@
  limitations under the License.
 */
 
+// Package locking holds the lock wrappers of the shim and the taxonomy of the lock order.
+//
+// The order below is the shim lock order of docs/how-yunikorn-works.md rule 9.3, extended with
+// the scheduler cache as its leaf, and it is the same taxonomy the runtime check in
+// lockclass.go carries: the class names are the names that check prints, and the edges are the
+// ones it declares. The two are kept in step by TestLockOrderAnnotationsMatchRuntime.
+//
+// The placeholder manager has a class but no edge. The only relation the code shows is manager
+// first, and that is a ledgered finding rather than a documented order, so neither direction is
+// declared, see the note on declaredOrder in lockclass_deadlock.go. There is no annotation for
+// "this pair is deliberately unordered": leaving a class out of every edge is how it is said,
+// and this comment is what records that it was a decision.
+//
+// +lockorder:cache.Context < cache.Application
+// +lockorder:cache.Application < cache.Task
+// +lockorder:cache.Task < external.SchedulerCache
 package locking
 
 import (
@@ -62,12 +78,21 @@ func initClassOrder() {
 	}
 }
 
+// Mutex, and RWMutex below it, declare themselves lock primitives to the checklocks analysis.
+// Without the declaration the analysis recognises a lock by its type name only, so the
+// forwarders in forwarders.go read as ordinary methods that take a lock and return without
+// releasing it and every one of them needs a "+checklocksignore" to silence that; see
+// forwarders.go for what those ignores cost. Whether a type behaves as a Mutex or an RWMutex
+// is taken from the type itself: it has an RLock method or it does not.
+//
+// +checklockslocktype
 type Mutex struct {
 	mu godeadlock.Mutex
 	// class is the ordering class, see lockclass.go. Zero means the lock is not ordered.
 	class atomic.Uint32
 }
 
+// +checklockslocktype
 type RWMutex struct {
 	mu godeadlock.RWMutex
 	// class is the ordering class, see lockclass.go. Zero means the lock is not ordered.

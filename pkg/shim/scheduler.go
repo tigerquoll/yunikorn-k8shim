@@ -245,14 +245,12 @@ func (ss *KubernetesShim) checkOutstandingApps() {
 	ss.setOutstandingAppsFound(false)
 }
 
-// +checklocksexcludewrite:ss.lock
 func (ss *KubernetesShim) getOutstandingAppsFound() bool {
 	ss.lock.RLock()
 	defer ss.lock.RUnlock()
 	return ss.outstandingAppsFound
 }
 
-// +checklocksexclude:ss.lock
 func (ss *KubernetesShim) setOutstandingAppsFound(value bool) {
 	ss.lock.Lock()
 	defer ss.lock.Unlock()

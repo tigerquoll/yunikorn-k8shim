@@ -145,7 +145,6 @@ func CreateWebhook(ac *admission.AdmissionController, port int) *WebHook {
 	}
 }
 
-// +checklocksexclude:wh.Mutex
 func (wh *WebHook) Startup(certs *tls.Certificate) {
 	wh.Lock()
 	defer wh.Unlock()
@@ -184,7 +183,6 @@ func (wh *WebHook) Startup(certs *tls.Certificate) {
 		zap.Strings("listeningOn", []string{healthURL, mutateURL, validateConfURL}))
 }
 
-// +checklocksexclude:wh.Mutex
 func (wh *WebHook) Shutdown() {
 	wh.Lock()
 	defer wh.Unlock()

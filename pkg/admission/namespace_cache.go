@@ -70,7 +70,6 @@ func NewNamespaceCache(namespaces informersv1.NamespaceInformer) (*NamespaceCach
 }
 
 // enableYuniKorn returns the value for the enableYuniKorn flag (tri-state UNSET, TRUE or FALSE) for the namespace.
-// +checklocksexcludewrite:nsc.RWMutex
 func (nsc *NamespaceCache) enableYuniKorn(name string) triState {
 	nsc.RLock()
 	defer nsc.RUnlock()
@@ -83,7 +82,6 @@ func (nsc *NamespaceCache) enableYuniKorn(name string) triState {
 }
 
 // generateAppID returns the value for the generateAppID flag (tri-state UNSET, TRUE or FALSE) for the namespace.
-// +checklocksexcludewrite:nsc.RWMutex
 func (nsc *NamespaceCache) generateAppID(name string) triState {
 	nsc.RLock()
 	defer nsc.RUnlock()
@@ -96,7 +94,6 @@ func (nsc *NamespaceCache) generateAppID(name string) triState {
 }
 
 // namespaceExists for test only to see if the namespace has been added to the cache or not.
-// +checklocksexcludewrite:nsc.RWMutex
 func (nsc *NamespaceCache) namespaceExists(name string) bool {
 	nsc.RLock()
 	defer nsc.RUnlock()

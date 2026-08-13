@@ -18,9 +18,9 @@
 
 module github.com/apache/yunikorn-k8shim/scripts/checklocks
 
-go 1.26.3
+go 1.25.0
 
-require gvisor.dev/gvisor v0.0.0-20260811011956-3434348e5909
+require github.com/tigerquoll/checklocks v0.6.1
 
 require (
 	golang.org/x/mod v0.34.0 // indirect

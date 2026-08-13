@@ -81,11 +81,19 @@ func initDispatcher() {
 		zap.Float64("DispatchTimeoutInSeconds", dispatcher.dispatchTimeout.Seconds()))
 }
 
-// The functions below take the dispatcher lock. They carry no "+checklocksexclude"
-// annotation even though they are the self locking API of this package: the lock is only
-// reachable through the package level dispatcher variable and resolving a lock held by a
-// global at an analysed call site crashes the pinned checklocks version in
-// globalGuard.resolveCall. Revisit when the tool is updated.
+// The functions below are the self locking API of this package: they take the lock of the
+// dispatcher singleton, so it must not be held when they are called. The annotations say so, and
+// the analysis enforces them for a caller in this package that holds the lock through the
+// package level variable. Two shapes it cannot see:
+//   - a caller that reaches the lock through getDispatcher() rather than the variable. The
+//     analysis has no way to know the returned pointer is that variable, so it does not know the
+//     lock the caller holds is the excluded one.
+//   - a caller in another package. The variable is unexported and export data does not carry
+//     unexported package level variables, so the guard cannot be resolved in pkg/cache or
+//     pkg/shim where most callers live.
+//
+// The runtime lock class order check covers what crosses packages.
+// +checklocksexclude:dispatcher.lock
 func RegisterEventHandler(handlerID string, eventType EventType, handlerFn func(interface{})) {
 	eventDispatcher := getDispatcher()
 	eventDispatcher.lock.Lock()
@@ -96,6 +104,7 @@ func RegisterEventHandler(handlerID string, eventType EventType, handlerFn func(
 	eventDispatcher.handlers[eventType][handlerID] = handlerFn
 }
 
+// +checklocksexclude:dispatcher.lock
 func UnregisterEventHandler(handlerID string, eventType EventType) {
 	eventDispatcher := getDispatcher()
 	eventDispatcher.lock.Lock()
@@ -108,6 +117,7 @@ func UnregisterEventHandler(handlerID string, eventType EventType) {
 	}
 }
 
+// +checklocksexclude:dispatcher.lock
 func UnregisterAllEventHandlers() {
 	eventDispatcher := getDispatcher()
 	eventDispatcher.lock.Lock()
@@ -116,6 +126,7 @@ func UnregisterAllEventHandlers() {
 }
 
 // a thread-safe way to get event handlers
+// +checklocksexcludewrite:dispatcher.lock
 func getEventHandler(eventType EventType) func(interface{}) {
 	eventDispatcher := getDispatcher()
 	eventDispatcher.lock.RLock()

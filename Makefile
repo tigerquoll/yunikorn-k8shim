@@ -178,10 +178,12 @@ GOLANGCI_LINT_ARCHIVE=$(GOLANGCI_LINT_ARCHIVEBASE).tar.gz
 export PATH := $(BASE_DIR)/$(GOLANGCI_LINT_PATH):$(PATH)
 
 # checklocks
-# gvisor does not publish semantic versions, only date based pseudo versions: update by
-# picking a newer pseudo version from the gvisor master branch and running "go get" in
-# scripts/checklocks, which pins the version and its checksums.
-CHECKLOCKS_VERSION=$(shell "$(GO)" list -C "$(BASE_DIR)/scripts/checklocks" -m -f '{{ .Version }}' gvisor.dev/gvisor)
+# The analyser is gVisor's tools/checklocks, consumed through the standalone extraction in
+# github.com/tigerquoll/checklocks because gVisor does not publish it as an importable module.
+# See scripts/checklocks/tools.go for the provenance and for the fixes that pin carries.
+# To update: run "go get github.com/tigerquoll/checklocks@<tag>" in scripts/checklocks, which
+# pins the version and its checksums, then run this target.
+CHECKLOCKS_VERSION=$(shell "$(GO)" list -C "$(BASE_DIR)/scripts/checklocks" -m -f '{{ .Version }}' github.com/tigerquoll/checklocks)
 # The binary is a vet tool: its export data must match the toolchain that runs "go vet" or
 # every run fails with a version mismatch. The go version is part of the path to force a
 # rebuild when the repo moves to a new toolchain.
@@ -192,11 +194,12 @@ CHECKLOCKS_BIN=$(CHECKLOCKS_PATH)/checklocks
 CHECKLOCKS_CANARY=checklocks_canary.go
 export PATH := $(BASE_DIR)/$(CHECKLOCKS_PATH):$(PATH)
 
-# The go version of the tools module is the version gvisor requires, which can be newer than
-# the version in .go_version. Building the tool with a newer toolchain than the one running
-# "go vet" gives an export data mismatch on every run, so this refuses to go any further.
-# The local toolchain is what matters: with GOTOOLCHAIN=auto an older go silently downloads
-# and uses a newer one to build the tool, which is exactly the mismatch to avoid.
+# The tools module states the go version the analyser needs. It is below the version in
+# .go_version, so the shim toolchain always satisfies it and no toolchain switch can happen
+# while building the tool. The check stays because the direction that matters is the other one:
+# building the tool with a different toolchain than the one running "go vet" gives an export
+# data mismatch on every run. The local toolchain is what is compared, with GOTOOLCHAIN=auto an
+# older go silently downloads and uses a newer one to build the tool, which is that mismatch.
 define checklocks_check_toolchain
 	required=$$("$(GO)" list -C "$(BASE_DIR)/scripts/checklocks" -m -f '{{ .GoVersion }}') ; \
 	found=$$(GOTOOLCHAIN=local "$(GO)" env GOVERSION | sed -e 's/^go//') ; \
@@ -346,16 +349,15 @@ $(GINKGO_BIN):
 	@GOBIN="$(BASE_DIR)/$(GINKGO_PATH)" "$(GO)" install "github.com/onsi/ginkgo/v2/ginkgo@$(GINKGO_VERSION)"
 
 # Install checklocks
-# Built from the tools module in scripts/checklocks: gvisor is a tool only dependency and
-# must not end up in the go.mod of the shim. That module pins the version and the checksums
-# of gvisor and declares the go version gvisor itself requires, which is not necessarily the
-# version in .go_version.
+# Built from the tools module in scripts/checklocks: the analyser is a tool only dependency and
+# must not end up in the go.mod of the shim. That module pins the version and the checksums of
+# the analyser and declares the go version it requires.
 $(CHECKLOCKS_BIN):
 	@$(checklocks_check_toolchain)
 	@echo "installing checklocks $(CHECKLOCKS_VERSION)"
 	@mkdir -p "$(CHECKLOCKS_PATH)"
 	@"$(GO)" build -C "$(BASE_DIR)/scripts/checklocks" \
-		-o "$(BASE_DIR)/$(CHECKLOCKS_BIN)" gvisor.dev/gvisor/tools/checklocks/cmd/checklocks
+		-o "$(BASE_DIR)/$(CHECKLOCKS_BIN)" github.com/tigerquoll/checklocks/cmd/checklocks
 
 # Run lint against the previous commit for PR and branch build
 # In dev setup look at all changes on top of master
@@ -371,22 +373,36 @@ lint: $(GOLANGCI_LINT_BIN)
 # Only the non test files of each package are checked, go vet has no way to exclude test
 # files so they are passed to it explicitly. The inferred lock analysis is turned off, it
 # only produces suggestions, and those are unstable and cannot always be acted upon.
+# The four analyses are named rather than left to the defaults of the tool, so that a release
+# that changes what runs by default cannot silently stop one of them:
+#   checklocks    guarded fields and the lock preconditions of a function
+#   lockorder     the acquisition order of the lock classes declared in pkg/locking
+#   lockstringer  lazily evaluated methods reading guarded fields
+#   lockblocking  waits taken while a declared lock class is held
 # The run starts with a self test on a fixture that must be reported, see the canary file
 # in pkg/locking: an analysis that reports nothing at all would pass this target silently.
-# The self test covers one violation of each annotation class in use, a guarded field and a
-# lock precondition, both must show up in its output.
+# The fixture carries at least one violation per analysis and every one of them has to show up
+# in its output. checklocks has six: the guarded field, the lock precondition, the lock taken
+# twice, which is only reported while the wrappers declare themselves lock primitives, the
+# same precondition reached from inside a callback, which is only reported while a guard can
+# name a value the body recovers by a type assertion, as the fsm callbacks in pkg/cache do,
+# and the two that no annotation states any more, an exclusion derived from the body and a
+# guard the structure declares for its fields, which 179 deleted annotations now rest on.
+CHECKLOCKS_ANALYZERS := -checklocks -lockorder -lockstringer -lockblocking -checklocks.inferred=false
 CHECKLOCKS_PACKAGES := $(REPO)/...
 checklocks: $(CHECKLOCKS_BIN)
 	@$(checklocks_check_toolchain)
 	@echo "running checklocks self test"
 	@files=$$("$(GO)" list -f '{{$$dir := .Dir}}{{range .GoFiles}}{{$$dir}}/{{.}} {{end}}' $(REPO)/locking) ; \
 	canary=$$("$(GO)" list -f '{{.Dir}}' $(REPO)/locking)/$(CHECKLOCKS_CANARY) ; \
-	out=$$("$(GO)" vet "-vettool=$(BASE_DIR)/$(CHECKLOCKS_BIN)" -inferred=false $$files "$$canary" 2>&1) ; \
+	out=$$("$(GO)" vet "-vettool=$(BASE_DIR)/$(CHECKLOCKS_BIN)" $(CHECKLOCKS_ANALYZERS) $$files "$$canary" 2>&1) ; \
 	status=$$? ; \
-	if [ $$status -eq 0 ] || ! printf '%s\n' "$$out" | grep -q "invalid field access" \
-		|| ! printf '%s\n' "$$out" | grep -q "must not hold" ; then \
-		echo "the checklocks analysis no longer reports the unguarded write or the re-entry" ; \
-		echo "in $(CHECKLOCKS_CANARY):" ; \
+	missing="" ; \
+	for want in "invalid field access" "must not hold" "already locked" "to call callbackSelfLocking" "must not nest" "guarded read races" "a wait under a lock stalls" "to call derivedSelfLocking" "when accessing structGuardedValue" ; do \
+		printf '%s\n' "$$out" | grep -q "$$want" || missing="$$missing\n  $$want" ; \
+	done ; \
+	if [ $$status -eq 0 ] || [ -n "$$missing" ] ; then \
+		echo "the analysis of $(CHECKLOCKS_CANARY) no longer reports:$$missing" ; \
 		echo "$$out" ; \
 		echo "nothing this target reports can be trusted, see $(CHECKLOCKS_CANARY)" ; \
 		exit 1 ; \
@@ -395,7 +411,7 @@ checklocks: $(CHECKLOCKS_BIN)
 	@status=0 ; \
 	for pkg in $$("$(GO)" list $(CHECKLOCKS_PACKAGES)) ; do \
 		files=$$("$(GO)" list -f '{{$$dir := .Dir}}{{range .GoFiles}}{{$$dir}}/{{.}} {{end}}' "$$pkg") ; \
-		"$(GO)" vet "-vettool=$(BASE_DIR)/$(CHECKLOCKS_BIN)" -inferred=false $$files || status=1 ; \
+		"$(GO)" vet "-vettool=$(BASE_DIR)/$(CHECKLOCKS_BIN)" $(CHECKLOCKS_ANALYZERS) $$files || status=1 ; \
 	done ; \
 	exit $$status
 

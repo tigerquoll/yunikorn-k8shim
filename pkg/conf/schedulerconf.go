@@ -140,7 +140,6 @@ type PlaceHolderConfig struct {
 	FSGroup    int64  `json:"fsGroup,omitempty"`
 }
 
-// +checklocksexcludewrite:conf.RWMutex
 func (conf *SchedulerConf) Clone() *SchedulerConf {
 	conf.RLock()
 	defer conf.RUnlock()
@@ -273,21 +272,18 @@ func SetSchedulerConf(conf *SchedulerConf) {
 	confHolder.Store(conf)
 }
 
-// +checklocksexcludewrite:conf.RWMutex
 func (conf *SchedulerConf) IsConfigReloadable() bool {
 	conf.RLock()
 	defer conf.RUnlock()
 	return conf.EnableConfigHotRefresh
 }
 
-// +checklocksexcludewrite:conf.RWMutex
 func (conf *SchedulerConf) GetSchedulingInterval() time.Duration {
 	conf.RLock()
 	defer conf.RUnlock()
 	return conf.Interval
 }
 
-// +checklocksexcludewrite:conf.RWMutex
 func (conf *SchedulerConf) GetKubeConfigPath() string {
 	conf.RLock()
 	defer conf.RUnlock()

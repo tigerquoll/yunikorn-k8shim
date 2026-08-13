@@ -40,6 +40,7 @@ import (
 	"github.com/apache/yunikorn-scheduler-interface/lib/go/si"
 )
 
+// +lockclass:cache.Application
 type Application struct {
 	applicationID string
 	queue         string
@@ -81,6 +82,7 @@ const transitionErr = "no transition"
 // submission path.
 // YUNIKORN-XXXX: that leaves taskMap read without the lock while other threads can add or
 // remove tasks. The fix is a snapshot taken by the caller, not a lock in this method.
+// +lockstringerignore
 func (app *Application) String() string {
 	return fmt.Sprintf("applicationID: %s, queue: %s, partition: %s,"+
 		" totalNumOfTasks: %d, currentState: %s",
@@ -109,7 +111,6 @@ func NewApplication(appID, queueName, user string, groups []string, tags map[str
 	return app
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) handle(ev events.ApplicationEvent) error {
 	// Locking mechanism:
 	// 1) when handle event transitions, we first obtain the object's lock,
@@ -130,70 +131,60 @@ func (app *Application) handle(ev events.ApplicationEvent) error {
 	return nil
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) canHandle(ev events.ApplicationEvent) bool {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.sm.Can(ev.GetEvent())
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) GetTask(taskID string) *Task {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.taskMap[taskID]
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) GetApplicationID() string {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.applicationID
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) GetQueue() string {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.queue
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) GetUser() string {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.user
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) setTaskGroupsDefinition(taskGroupsDef string) {
 	app.lock.Lock()
 	defer app.lock.Unlock()
 	app.taskGroupsDefinition = taskGroupsDef
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) GetTaskGroupsDefinition() string {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.taskGroupsDefinition
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) setSchedulingParamsDefinition(schedParamsDef string) {
 	app.lock.Lock()
 	defer app.lock.Unlock()
 	app.schedulingParamsDefinition = schedParamsDef
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) GetSchedulingParamsDefinition() string {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.schedulingParamsDefinition
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) setTaskGroups(taskGroups []TaskGroup) {
 	app.lock.Lock()
 	defer app.lock.Unlock()
@@ -203,42 +194,36 @@ func (app *Application) setTaskGroups(taskGroups []TaskGroup) {
 	}
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) getPlaceholderAsk() *si.Resource {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.placeholderAsk
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) getTaskGroups() []TaskGroup {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.taskGroups
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) setPlaceholderOwnerReferences(ref []metav1.OwnerReference) {
 	app.lock.Lock()
 	defer app.lock.Unlock()
 	app.placeholderOwnerReferences = ref
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) getPlaceholderOwnerReferences() []metav1.OwnerReference {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.placeholderOwnerReferences
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) setSchedulingStyle(schedulingStyle string) {
 	app.lock.Lock()
 	defer app.lock.Unlock()
 	app.schedulingStyle = schedulingStyle
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) setOriginatingTask(task *Task) {
 	app.lock.Lock()
 	defer app.lock.Unlock()
@@ -249,14 +234,12 @@ func (app *Application) setContext(ctx *Context) {
 	app.context = ctx
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) GetOriginatingTask() *Task {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.originatingTask
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) addTask(task *Task) {
 	app.lock.Lock()
 	defer app.lock.Unlock()
@@ -267,7 +250,6 @@ func (app *Application) addTask(task *Task) {
 	app.taskMap[task.taskID] = task
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) RemoveTask(taskID string) {
 	app.lock.Lock()
 	defer app.lock.Unlock()
@@ -290,35 +272,30 @@ func (app *Application) GetApplicationState() string {
 	return app.sm.Current()
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) GetPendingTasks() []*Task {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.getTasks(TaskStates().Pending)
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) GetNewTasks() []*Task {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.getTasks(TaskStates().New)
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) GetAllocatedTasks() []*Task {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.getTasks(TaskStates().Allocated)
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) GetBoundTasks() []*Task {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
 	return app.getTasks(TaskStates().Bound)
 }
 
-// +checklocksexcludewrite:app.lock
 func (app *Application) GetPlaceHolderTasks() []*Task {
 	app.lock.RLock()
 	defer app.lock.RUnlock()
@@ -383,14 +360,12 @@ func (app *Application) AreAllTasksTerminated() bool {
 
 // SetState is only for testing
 // this is just used for testing, it is not supposed to change state like this
-// +checklocksexclude:app.lock
 func (app *Application) SetState(state string) {
 	app.lock.Lock()
 	defer app.lock.Unlock()
 	app.sm.SetState(state)
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) TriggerAppSubmission() error {
 	return app.handle(NewSubmitApplicationEvent(app.applicationID))
 }
@@ -402,7 +377,6 @@ func (app *Application) TriggerAppSubmission() error {
 // ensure non of these calls is expensive, usually, they
 // do nothing more than just triggering the state transition.
 // return true if the app needs scheduling or false if not
-// +checklocksexclude:app.lock
 func (app *Application) Schedule() bool {
 	switch app.GetApplicationState() {
 	case ApplicationStates().New:
@@ -756,14 +730,12 @@ func (app *Application) publishPlaceholderTimeoutEvents(task *Task) {
 	}
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) SetPlaceholderTimeout(timeout int64) {
 	app.lock.Lock()
 	defer app.lock.Unlock()
 	app.placeholderTimeoutInSec = timeout
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) removeCompletedTasks() {
 	app.lock.Lock()
 	defer app.lock.Unlock()
@@ -774,7 +746,6 @@ func (app *Application) removeCompletedTasks() {
 	}
 }
 
-// +checklocksexclude:app.lock
 func (app *Application) tryAddReleasableTask(task *Task) bool {
 	app.lock.Lock()
 	defer app.lock.Unlock()
@@ -801,6 +772,11 @@ func (app *Application) clearReleaseableTasks() {
 
 // flushReleaseableTasks replays deferred task releases after the application has been accepted
 // by the scheduler core. Must be called while the application lock is held.
+//
+// YUNIKORN-XXXX: releaseAllocation reaches tryAddReleasableTask, which takes the application
+// lock this call already holds. Only the force argument keeps it away from that path, so the
+// analysis reports a nesting it cannot rule out. Restructure rather than rely on the flag.
+// +lockorderignore
 // +checklocks:app.lock
 func (app *Application) flushReleaseableTasks() {
 	if len(app.releaseableTasks) == 0 {

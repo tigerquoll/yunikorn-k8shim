@@ -82,41 +82,28 @@ const (
 	DefaultAccessControlExternalGroups   = ""
 )
 
+// +checklocksguardedby:lock
 type AdmissionControllerConf struct {
-	namespace  string
+	// +checklocksunguarded
+	namespace string
+	// +checklocksunguarded
 	kubeConfig string
 
-	// mutable values require locking
-	// +checklocks:lock
-	enableConfigHotRefresh bool
-	// +checklocks:lock
-	policyGroup string
-	// +checklocks:lock
-	amServiceName string
-	// +checklocks:lock
+	enableConfigHotRefresh  bool
+	policyGroup             string
+	amServiceName           string
 	schedulerServiceAddress string
-	// +checklocks:lock
-	processNamespaces []*regexp.Regexp
-	// +checklocks:lock
-	bypassNamespaces []*regexp.Regexp
-	// +checklocks:lock
-	labelNamespaces []*regexp.Regexp
-	// +checklocks:lock
-	noLabelNamespaces []*regexp.Regexp
-	// +checklocks:lock
-	generateUniqueAppIds bool
-	// +checklocks:lock
-	bypassAuth bool
-	// +checklocks:lock
-	trustControllers bool
-	// +checklocks:lock
-	systemUsers []*regexp.Regexp
-	// +checklocks:lock
-	externalUsers []*regexp.Regexp
-	// +checklocks:lock
-	externalGroups []*regexp.Regexp
-	// +checklocks:lock
-	configMaps []*v1.ConfigMap
+	processNamespaces       []*regexp.Regexp
+	bypassNamespaces        []*regexp.Regexp
+	labelNamespaces         []*regexp.Regexp
+	noLabelNamespaces       []*regexp.Regexp
+	generateUniqueAppIds    bool
+	bypassAuth              bool
+	trustControllers        bool
+	systemUsers             []*regexp.Regexp
+	externalUsers           []*regexp.Regexp
+	externalGroups          []*regexp.Regexp
+	configMaps              []*v1.ConfigMap
 
 	lock locking.RWMutex
 }
@@ -147,14 +134,12 @@ func (acc *AdmissionControllerConf) GetKubeConfig() string {
 	return acc.kubeConfig
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetEnableConfigHotRefresh() bool {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
 	return acc.enableConfigHotRefresh
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetPolicyGroup() string {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
@@ -165,84 +150,72 @@ func GetPendingPolicyGroup(configs map[string]string) string {
 	return parseConfigString(configs, schedulerconf.CMSvcPolicyGroup, schedulerconf.DefaultPolicyGroup)
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetAmServiceName() string {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
 	return acc.amServiceName
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetSchedulerServiceAddress() string {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
 	return acc.schedulerServiceAddress
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetProcessNamespaces() []*regexp.Regexp {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
 	return acc.processNamespaces
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetBypassNamespaces() []*regexp.Regexp {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
 	return acc.bypassNamespaces
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetLabelNamespaces() []*regexp.Regexp {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
 	return acc.labelNamespaces
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetNoLabelNamespaces() []*regexp.Regexp {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
 	return acc.noLabelNamespaces
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetGenerateUniqueAppIds() bool {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
 	return acc.generateUniqueAppIds
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetBypassAuth() bool {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
 	return acc.bypassAuth
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetTrustControllers() bool {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
 	return acc.trustControllers
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetSystemUsers() []*regexp.Regexp {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
 	return acc.systemUsers
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetExternalUsers() []*regexp.Regexp {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
 	return acc.externalUsers
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetExternalGroups() []*regexp.Regexp {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
@@ -303,14 +276,12 @@ func (h *configMapUpdateHandler) configMapIndex(configMap *v1.ConfigMap) (int, b
 	}
 }
 
-// +checklocksexclude:acc.lock
 func (acc *AdmissionControllerConf) configUpdated(index int, configMap *v1.ConfigMap) {
 	configMaps := acc.GetConfigMaps()
 	configMaps[index] = configMap
 	acc.updateConfigMaps(configMaps, false)
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) GetConfigMaps() []*v1.ConfigMap {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
@@ -320,7 +291,6 @@ func (acc *AdmissionControllerConf) GetConfigMaps() []*v1.ConfigMap {
 	return result
 }
 
-// +checklocksexclude:acc.lock
 func (acc *AdmissionControllerConf) updateConfigMaps(configMaps []*v1.ConfigMap, initial bool) {
 	acc.lock.Lock()
 	defer acc.lock.Unlock()
@@ -364,7 +334,6 @@ func (acc *AdmissionControllerConf) updateConfigMaps(configMaps []*v1.ConfigMap,
 	acc.dumpConfigurationInternal()
 }
 
-// +checklocksexcludewrite:acc.lock
 func (acc *AdmissionControllerConf) DumpConfiguration() {
 	acc.lock.RLock()
 	defer acc.lock.RUnlock()
