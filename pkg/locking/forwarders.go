@@ -1,3 +1,5 @@
+//go:build !deadlock
+
 /*
  Licensed to the Apache Software Foundation (ASF) under one
  or more contributor license agreements.  See the NOTICE file
@@ -48,6 +50,10 @@ package locking
 // The forwarding costs nothing at runtime, the methods are inlined. The only visible effect
 // is one extra stack frame in a go-deadlock report: the "<<<<<" marker points at the
 // forwarder in this file with the real caller one frame below it.
+
+// This is the default build: the lock class order check (see lockclass.go) is only compiled into
+// the deadlock tagged build, so these forwarders are exactly the plain forwarding calls and stay
+// inlinable. The instrumented copies live in forwarders_deadlock.go.
 
 func (m *Mutex) Lock() {
 	m.mu.Lock()

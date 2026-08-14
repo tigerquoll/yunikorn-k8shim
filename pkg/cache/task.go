@@ -115,6 +115,7 @@ func createTaskInternal(tid string, app *Application, resource *si.Resource,
 		schedulingState: TaskSchedPending,
 		lock:            &locking.RWMutex{},
 	}
+	task.lock.SetClass(locking.ClassTask)
 	if tgName := utils.GetTaskGroupFromPodSpec(pod); tgName != "" {
 		task.taskGroupName = tgName
 	}

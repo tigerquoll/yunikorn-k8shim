@@ -64,6 +64,7 @@ func NewPlaceholderManager(clients *client.Clients) *PlaceholderManager {
 		stopChan:    make(chan struct{}),
 		cleanupTime: 5 * time.Second,
 	}
+	placeholderMgr.SetClass(locking.ClassPlaceholderManager)
 	return placeholderMgr
 }
 
