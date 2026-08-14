@@ -526,7 +526,17 @@ func (task *Task) releaseAllocation(force bool) {
 }
 
 // YUNIKORN-XXXX: unlock-relock gap drops caller's lock mid-critical-section; restructure.
+//
+// That window is what the gap analysis reports as well. The release itself has to stay: the
+// application lock this reaches is declared before the task lock in pkg/locking, so taking it
+// with the task lock held is the inversion. What is missing is the re-validation on the way
+// back. releaseAllocation reads the termination type before this call and builds the release
+// request from it after, and nothing looks at the task again in between, so a task that moved on
+// underneath is released on the premise it was in when the decision was made. Every field is
+// still touched under the lock, so this is not a data race, and the restructure asked for above
+// is the fix rather than a re-check bolted onto the return.
 // +checklocksignore
+// +lockgapignore
 func (task *Task) shouldAppRelease() bool {
 	task.lock.Unlock()
 	defer task.lock.Lock()

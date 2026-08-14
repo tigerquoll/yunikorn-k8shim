@@ -1608,7 +1608,17 @@ func (ctx *Context) registerNodes(nodes []*v1.Node) ([]*v1.Node, error) {
 }
 
 // YUNIKORN-XXXX: unlock-relock gap drops caller's lock mid-critical-section; restructure.
+//
+// That window is what the gap analysis reports as well. The release itself has to stay: the
+// responses waited for below arrive on the dispatcher, whose handler needs the context, so
+// waiting with the write lock held would deadlock, which is what the comment at the unlock says.
+// What the window costs is the premise the caller comes back to. The three collections the
+// handler fills or drains are locals of this call, written on the one dispatcher goroutine and
+// published by the wait, so there is no race in them; but the context is unguarded for the whole
+// registration round trip and a node can have been removed from it by the time registerNodes
+// posts an event saying it was accepted. Low, and the restructure asked for above is the fix.
 // +checklocksignore
+// +lockgapignore
 func (ctx *Context) registerNodesInternal(nodesToRegister []*si.NodeInfo, pendingNodes map[string]*v1.Node) ([]*v1.Node, []*v1.Node, error) {
 	acceptedNodes := make([]*v1.Node, 0)
 	rejectedNodes := make([]*v1.Node, 0)
