@@ -772,9 +772,15 @@ func (app *Application) clearReleaseableTasks() {
 // flushReleaseableTasks replays deferred task releases after the application has been accepted
 // by the scheduler core. Must be called while the application lock is held.
 //
-// YUNIKORN-XXXX: releaseAllocation reaches tryAddReleasableTask, which takes the application
-// lock this call already holds. Only the force argument keeps it away from that path.
-// Restructure rather than rely on the flag.
+// YUNIKORN-3089: releaseAllocation reaches tryAddReleasableTask, which takes the application
+// lock this call already holds. Only the force argument keeps it away from that path, so the
+// analysis reports a nesting it cannot rule out. Restructure rather than rely on the flag.
+//
+// The ignore sits on the function rather than on the call, so it covers every acquisition the
+// body makes and not only the releaseAllocation path. That is acceptable while nothing else in
+// the body takes a classed lock: removeApplication takes none, and removeFromSchedulerCore
+// leaves the shim through the scheduler API. The restructure takes the marker with it.
+// +lockorderignore
 // +checklocks:app.lock
 func (app *Application) flushReleaseableTasks() {
 	if len(app.releaseableTasks) == 0 {

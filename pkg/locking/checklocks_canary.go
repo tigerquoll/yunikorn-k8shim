@@ -18,6 +18,11 @@
  limitations under the License.
 */
 
+// The edge below, and the two classes it relates, belong to this file alone. They are read only
+// when the analyzer is handed this file, which no build ever is, so the taxonomy declared in
+// locking.go is not affected by them.
+//
+// +lockorder:canary.Outer < canary.Inner
 package locking
 
 import "fmt"
@@ -45,10 +50,16 @@ import "fmt"
 // 179 hand written annotations be deleted. An analyser that stopped deriving either would
 // take that protection with it and leave every other message of this fixture intact, so both
 // are required by name: see derivedReentrantCall and structGuardViolation below.
+//
+// The order analysis has two rules and they are lost separately, so there is a fixture for
+// each: upwardAcquire takes the two classes of the edge declared above in the wrong direction,
+// and nestSameClass nests two locks of one class, which is the rule no instance keyed detector
+// can see and the one the shim breaks today, see flushReleaseableTasks in pkg/cache.
 
-// canary carries a lock class, which is what lockblocking keys on: it reports a wait made while
-// a CLASSED lock is held, so a type with no class of its own would leave waitUnderLock below
-// silent and the coverage lost without a single message going missing elsewhere.
+// canary carries a lock class, which is what both lockblocking and the order analysis key on:
+// the first reports a wait made while a CLASSED lock is held, so a type with no class of its
+// own would leave waitUnderLock below silent and the coverage lost without a single message
+// going missing elsewhere, and the second nests two of these in nestSameClass.
 //
 // +lockclass:canary.Canary
 type canary struct {
@@ -82,7 +93,10 @@ func (c *canary) setValueSelfLocking(value int) {
 
 // reEnter calls a method that excludes the lock while holding it, the self deadlock shape.
 // The self test in the Makefile requires the analysis to report "must not hold" for this
-// line.
+// line. The order analysis sees the same call as a nesting of two locks of one class; it is
+// silenced here so that nestSameClass stays the only source of that diagnostic and the self
+// test keeps one fixture per rule.
+// +lockorderignore
 func (c *canary) reEnter(value int) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -107,16 +121,18 @@ func (c *canary) relock(value int) {
 // that declaration the forwarding methods need a "+checklocksignore" each, and an ignore is
 // read at every call site of the function that carries it, so the whole class disappears for
 // every wrapper lock in the shim while every other message of this fixture stays exactly as
-// it is.
+// it is. The order analysis sees the same line as a nesting of two locks of one class; that is
+// silenced so nestSameClass stays the only source of that diagnostic.
 func (c *canary) doubleLock(value int) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	c.lock.Lock()
+	c.lock.Lock() // +lockorderignore
 	c.value = value
 }
 
 // derivedCanary is the subject of the derived exclusion fixture. Its lock and its field are
-// apart from the ones above so a diagnostic about either can only have come from here.
+// apart from the ones above so a diagnostic about either can only have come from here. It
+// carries no lock class: the order analysis has its own fixtures and should not see this one.
 type derivedCanary struct {
 	lock         RWMutex
 	derivedValue int // +checklocks:lock
@@ -135,7 +151,8 @@ func (d *derivedCanary) derivedSelfLocking(value int) {
 // derivedReentrantCall holds the lock over a call to a method that takes it. Nothing states
 // the exclusion, so the analysis must have derived it, and the self test requires the message
 // by the callee's name: the exclusions written by hand elsewhere in this fixture would keep it
-// green otherwise.
+// green otherwise. Unlike reEnter this needs no order suppression, because the type above
+// carries no class for the order analysis to nest.
 func (d *derivedCanary) derivedReentrantCall(value int) {
 	d.lock.Lock()
 	defer d.lock.Unlock()
@@ -172,7 +189,8 @@ func (s *structGuardCanary) structGuardViolation(value int) {
 }
 
 // callbackCanary is the subject of the callback fixture below. Its guarded field is named
-// apart from the one above so a diagnostic about it can only have come from there.
+// apart from the one above so a diagnostic about it can only have come from there. It carries
+// no lock class: the order analysis has its own fixtures and should not see this one.
 type callbackCanary struct {
 	lock RWMutex
 	// +checklocks:lock
@@ -231,4 +249,52 @@ func (c *canary) waitUnderLock(ch chan int) int {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	return <-ch
+}
+
+// nestSameClass locks two canaries at once. Two locks of one class must not nest, which the
+// order analysis reports without needing an edge, so the fixture states it without adding
+// anything to the taxonomy of the shim. It is required separately from the edge below because
+// it is a rule of its own rather than an edge of the declared order, and because it is the
+// rule the shim breaks today, see flushReleaseableTasks in pkg/cache.
+func (c *canary) nestSameClass(other *canary) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	other.lock.Lock()
+	defer other.lock.Unlock()
+}
+
+// canaryOuter is the before side of the edge declared at the top of this file. Nothing else in
+// this fixture relates to it, so a message about that edge can only have come from here.
+//
+// +lockclass:canary.Outer
+type canaryOuter struct {
+	lock RWMutex
+}
+
+// canaryInner is the after side of the same edge, in the second of the two shapes the shim
+// uses: an embedded lock rather than a named field.
+//
+// +lockclass:canary.Inner
+type canaryInner struct {
+	RWMutex
+}
+
+// downwardAcquire takes the two classes in the declared order. It must not be reported.
+func downwardAcquire(o *canaryOuter, i *canaryInner) {
+	o.lock.Lock()
+	defer o.lock.Unlock()
+	i.Lock()
+	defer i.Unlock()
+}
+
+// upwardAcquire is the other order violation: the outer class is declared before the inner one,
+// so taking it while the inner one is held is the inversion. The self test requires the message
+// about the declared order, which is what an analysis that stopped reading the "+lockorder"
+// lines would take with it while every other message here kept firing, leaving the three edges
+// of pkg/locking declared and unchecked.
+func upwardAcquire(o *canaryOuter, i *canaryInner) {
+	i.Lock()
+	defer i.Unlock()
+	o.lock.Lock()
+	defer o.lock.Unlock()
 }
