@@ -197,9 +197,12 @@ VETLOCK_CANARY=pkg/locking/checklocks_canary.go
 # the canary states on the type rather than on the field. Both are required by name because the
 # other messages here would keep the canary green if either derivation were lost, and 179
 # annotations were deleted from this repository on the strength of them.
-# The last two are the ordering rules, which are lost separately: an edge of the declared order,
+# Two of them are the ordering rules, which are lost separately: an edge of the declared order,
 # and the same class rule that no instance keyed detector can see.
-VETLOCK_CANARY_MESSAGES := "invalid field access" "must not hold" "already locked" "to call callbackSelfLocking" "guarded read races" "a wait under a lock" "to call derivedSelfLocking" "when accessing structGuardedValue" "the declared order has" "must not nest"
+# The last one is the release and re-acquisition window, which only reports while
+# "-lockgap.enable" is passed below, and is required by lock name so that it can only have come
+# from the fixture that exists for it.
+VETLOCK_CANARY_MESSAGES := "invalid field access" "must not hold" "already locked" "to call callbackSelfLocking" "guarded read races" "a wait under a lock" "to call derivedSelfLocking" "when accessing structGuardedValue" "the declared order has" "must not nest" "the gapMu lock is released"
 
 # kubectl
 KUBECTL_VERSION=$(shell go list -m 'k8s.io/kubernetes' | cut -d' ' -f 2)
@@ -373,23 +376,29 @@ lint: $(GOLANGCI_LINT_BIN)
 # Only the non test files of each package are checked, go vet has no way to exclude test
 # files so they are passed to it explicitly. The inferred lock analysis is turned off, it
 # only produces suggestions, and those are unstable and cannot always be acted upon.
-# The four analyses are named rather than left to the defaults of the tool, so that a release
+# The five analyses are named rather than left to the defaults of the tool, so that a release
 # that changes what runs by default cannot silently stop one of them:
 #   checklocks    guarded fields and the lock preconditions of a function
 #   lockstringer  lazily evaluated methods reading guarded fields
 #   lockblocking  waits taken while a declared lock class is held
 #   lockorder     the nesting of the lock classes against the order declared in pkg/locking
+#   lockgap       a lock released and taken again inside one function
 # "lockorder" is the one check that sees a pair of locks two goroutines take in opposite orders
 # without the two ever having to meet. Its hierarchy mode is left off: no class of the shim is
 # hierarchical, nothing here walks a tree of its own locks the way the queues of the core do.
+# "lockgap" reports the second half of a section acting on what the first half established with
+# anything free to have run in between. It needs both of its switches. Naming it only selects it,
+# as it does for every analysis above; a registered analysis has no off state in the multi
+# analyzer binary, so the one that ships opt-in carries "-lockgap.enable" of its own and reports
+# nothing without it.
 # The listing is a single pass, one line of file names per package, and a listing that fails
 # aborts the target: a package that cannot be loaded must not be skipped silently. Every
 # package is checked before the target fails so that one violation does not hide the rest,
 # which is why the loop carries a status rather than stopping at the first failure. The loop
 # is the last element of the pipeline and exits with that status, the pipeline takes it as
 # its own, otherwise it would be lost with the subshell the loop runs in.
-VETLOCK_ANALYZERS := -checklocks -lockstringer -lockblocking -lockorder
-VETLOCK_FLAGS := $(VETLOCK_ANALYZERS) -checklocks.inferred=false
+VETLOCK_ANALYZERS := -checklocks -lockstringer -lockblocking -lockorder -lockgap
+VETLOCK_FLAGS := $(VETLOCK_ANALYZERS) -checklocks.inferred=false -lockgap.enable=true
 VETLOCK_PACKAGES := $(REPO)/...
 vetlock: $(VETLOCK_BIN)
 	@echo "running vet-lock"

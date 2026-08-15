@@ -55,6 +55,11 @@ import "fmt"
 // each: upwardAcquire takes the two classes of the edge declared above in the wrong direction,
 // and nestSameClass nests two locks of one class, which is the rule no instance keyed detector
 // can see and the one the shim breaks today, see flushReleaseableTasks in pkg/cache.
+//
+// The last class is a lock released and taken again inside one function, which is only reported
+// while "-lockgap.enable" is on the command line and is off by default: see releaseAndRetake at
+// the end of this file, on a lock of its own so that the message the self test requires can only
+// have come from there.
 
 // canary carries a lock class, which is what both lockblocking and the order analysis key on:
 // the first reports a wait made while a CLASSED lock is held, so a type with no class of its
@@ -104,6 +109,11 @@ func (c *canary) reEnter(value int) {
 }
 
 // relock takes and releases the lock twice over, which is balanced. It must never be reported.
+//
+// The second acquisition is a release and re-acquisition window, so the gap analysis does see it,
+// and the ignore below keeps it out of that one: releaseAndRetake at the end of this file is the
+// fixture that carries the gap coverage, on a lock of its own.
+// +lockgapignore
 func (c *canary) relock(value int) {
 	c.lock.Lock()
 	c.value = value
@@ -297,4 +307,40 @@ func upwardAcquire(o *canaryOuter, i *canaryInner) {
 	defer i.Unlock()
 	o.lock.Lock()
 	defer o.lock.Unlock()
+}
+
+// gapCanary is the subject of the gap fixture. Its lock is named apart from the ones above so
+// that a diagnostic about it can only have come from here. It carries no lock class: the order
+// analysis has its own fixtures and should not see this one.
+type gapCanary struct {
+	// +checklocks:gapMu
+	gapValue int
+	gapMu    RWMutex
+}
+
+// gapPerIteration takes and releases the lock once per iteration, which is a whole critical
+// section each time round rather than a window in one. It must never be reported: a loop is
+// entered from outside it as well, which is what keeps every loop of the shim out of the output.
+func (g *gapCanary) gapPerIteration(values []int) {
+	for _, value := range values {
+		g.gapMu.Lock()
+		g.gapValue += value
+		g.gapMu.Unlock()
+	}
+}
+
+// releaseAndRetake drops the lock in the middle of the section and takes it again, so what was
+// read under the first half is stale by the time the second half writes it back. The self test in
+// the Makefile requires the analysis to report that the gapMu lock is released and taken again.
+//
+// This is the one message that is only produced while "-lockgap.enable" is on the command line,
+// and the flag is off by default, so it is what a switch quietly dropped from the make target
+// would take with it while every other message of this fixture kept firing.
+func (g *gapCanary) releaseAndRetake(value int) {
+	g.gapMu.Lock()
+	current := g.gapValue
+	g.gapMu.Unlock()
+	g.gapMu.Lock()
+	defer g.gapMu.Unlock()
+	g.gapValue = current + value
 }
