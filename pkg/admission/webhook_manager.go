@@ -68,9 +68,10 @@ type WebhookManager interface {
 	WaitForCertificateExpiration()
 }
 
-// The class exists so that lockblocking can see this lock is held. It is deliberately outside
-// the order taxonomy that pkg/locking declares and the runtime check carries: that taxonomy is
-// the scheduler cache objects, and this class has no ordering relation to any of them.
+// The class exists so that lockblocking can see this lock is held, and so that the runtime check
+// sees a manager lock nested inside another one. It carries no edge in the order taxonomy that
+// pkg/locking declares: that taxonomy is the scheduler cache objects, and this class has no
+// ordering relation to any of them.
 // +lockclass:admission.WebhookManager
 type webhookManagerImpl struct {
 	conf             *conf.AdmissionControllerConf
@@ -114,6 +115,7 @@ func newWebhookManagerImpl(conf *conf.AdmissionControllerConf, clientset kuberne
 		clientset:        clientset,
 		conflictAttempts: 10,
 	}
+	wm.SetClass(locking.ClassWebhookManager)
 
 	return wm
 }

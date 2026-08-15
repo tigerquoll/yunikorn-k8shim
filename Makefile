@@ -692,6 +692,7 @@ $(RELEASE_BIN_DIR)/$(TEST_SERVER_BINARY): go.mod go.sum $(shell find pkg)
 test: export DEADLOCK_DETECTION_ENABLED = true
 test: export DEADLOCK_TIMEOUT_SECONDS = 10
 test: export DEADLOCK_EXIT = true
+test: export DEADLOCK_CLASS_ORDER_ENABLED = true
 test:
 	@echo "running unit tests"
 	@mkdir -p "$(OUTPUT)"

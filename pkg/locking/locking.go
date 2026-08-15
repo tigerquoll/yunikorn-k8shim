@@ -22,6 +22,13 @@
 // up through its import rather than restating it. The classes themselves are declared on the
 // types that carry the locks, see the "+lockclass" annotations there.
 //
+// The same order is enforced at runtime by the class order check of lockclass_deadlock.go,
+// which reads its own copy of the graph from "declaredOrder". The two declarations are kept in
+// step by TestLockOrderAnnotationsMatchRuntime, which also checks that the class each type is
+// annotated with is the class its constructor registers with SetClass. A drift between them is
+// otherwise silent: the static side would pass what the runtime side rejects, or the other way
+// round, with no build ever failing.
+//
 // The relation is a partial order and it is closed transitively: a pair the closure does not
 // relate is not checked, because the taxonomy says nothing about it. Only the classes whose
 // order the shim actually settles are declared.
@@ -65,12 +72,22 @@
 package locking
 
 import (
+	"fmt"
+	"os"
+	"strconv"
 	"sync"
+	"sync/atomic"
 
 	godeadlock "github.com/sasha-s/go-deadlock"
 
 	corelocking "github.com/apache/yunikorn-core/pkg/locking"
 )
+
+// EnvClassOrderEnabled turns the lock class order check on, see lockclass.go. It sits next to the
+// DEADLOCK_* variables that the core locking package reads, the check is a part of the same
+// diagnostic build: it is only compiled in under the "deadlock" build tag and only active when this
+// is set.
+const EnvClassOrderEnabled = "DEADLOCK_CLASS_ORDER_ENABLED"
 
 var once sync.Once
 
@@ -78,7 +95,24 @@ func init() {
 	once.Do(func() {
 		// call into core locking package to ensure that all locks are globally configured
 		corelocking.IsTrackingEnabled()
+		initClassOrder()
 	})
+}
+
+// initClassOrder reads the switch of the lock class order check. The reporting itself goes through
+// the go-deadlock options that the core locking package has just configured, so that an order
+// violation is reported and acted on exactly like a detected deadlock.
+func initClassOrder() {
+	classOrder, err := strconv.ParseBool(os.Getenv(EnvClassOrderEnabled))
+	if err != nil {
+		classOrder = false
+	}
+	classOrderEnabled.Store(classOrder && classOrderSupported)
+	if classOrder && classOrderSupported {
+		// written before anything else is initialised, same as the core message
+		// no way to handle errors just ignore
+		_, _ = fmt.Fprintf(os.Stderr, "=== Lock class order checking enabled ===\n")
+	}
 }
 
 // Mutex, and RWMutex below it, declare themselves lock primitives to the checklocks analysis.
@@ -91,9 +125,13 @@ func init() {
 // +checklockslocktype
 type Mutex struct {
 	mu godeadlock.Mutex
+	// class is the ordering class, see lockclass.go. Zero means the lock is not ordered.
+	class atomic.Uint32
 }
 
 // +checklockslocktype
 type RWMutex struct {
 	mu godeadlock.RWMutex
+	// class is the ordering class, see lockclass.go. Zero means the lock is not ordered.
+	class atomic.Uint32
 }

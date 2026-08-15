@@ -74,6 +74,7 @@ func NewSchedulerCache(clients *client.Clients) *SchedulerCache {
 		clients:      clients,
 		klogger:      klog.NewKlogr(),
 	}
+	cache.lock.SetClass(locking.ClassSchedulerCache)
 	return cache
 }
 
