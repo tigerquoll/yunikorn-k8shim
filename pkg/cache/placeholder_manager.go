@@ -74,8 +74,10 @@ func (mgr *PlaceholderManager) createAppPlaceholders(app *Application) error {
 	defer mgr.Unlock()
 
 	// map task group to count of already created placeholders
+	// the accessor that takes the application lock: the manager lock held here says nothing about
+	// the application, whose task map is written as tasks are added to it
 	tgCounts := make(map[string]int32)
-	for _, ph := range app.getPlaceHolderTasks() {
+	for _, ph := range app.GetPlaceHolderTasks() {
 		tgCounts[ph.GetTaskGroupName()]++
 	}
 
