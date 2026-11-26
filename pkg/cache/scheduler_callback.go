@@ -19,12 +19,13 @@
 package cache
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/util/retry"
 
 	"github.com/apache/yunikorn-k8shim/pkg/common/utils"
 	"github.com/apache/yunikorn-k8shim/pkg/dispatcher"
@@ -37,13 +38,14 @@ import (
 // asynchronously to avoid blocking the scheduler.
 type AsyncRMCallback struct {
 	context *Context
+	stopCtx context.Context
 }
 
 var _ api.ResourceManagerCallback = &AsyncRMCallback{}
 var _ api.StateDumpPlugin = &AsyncRMCallback{}
 
-func NewAsyncRMCallback(ctx *Context) *AsyncRMCallback {
-	return &AsyncRMCallback{context: ctx}
+func NewAsyncRMCallback(ctx *Context, stopCtx context.Context) *AsyncRMCallback {
+	return &AsyncRMCallback{context: ctx, stopCtx: stopCtx}
 }
 
 func (callback *AsyncRMCallback) UpdateAllocation(response *si.AllocationResponse) error {
@@ -70,13 +72,34 @@ func (callback *AsyncRMCallback) UpdateAllocation(response *si.AllocationRespons
 			Duration: time.Second,
 			Cap:      30 * time.Second,
 		}
-		err := retry.OnError(backOff, func(err error) bool {
-			log.Log(log.ShimRMCallback).Error("AssumePod failed, retrying", zap.Error(err))
-			return true
-		}, func() error {
-			return callback.context.AssumePod(alloc.AllocationKey, alloc.NodeID)
+		var lastErr error
+		// ConditionWithContextFunc receives a context derived from callback.stopCtx; closure accesses callback.context directly.
+		err := wait.ExponentialBackoffWithContext(callback.stopCtx, backOff, func(_ context.Context) (bool, error) {
+			if assumeErr := callback.context.AssumePod(alloc.AllocationKey, alloc.NodeID); assumeErr != nil {
+				log.Log(log.ShimRMCallback).Error("AssumePod failed, retrying", zap.Error(assumeErr))
+				lastErr = assumeErr
+				return false, nil
+			}
+			return true, nil
 		})
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				// Shim is shutting down (context.DeadlineExceeded is checked defensively for future-proofing).
+				// Do not fall through to rollbackOnAssumePodFailure:
+				// rollback re-queues the ask to the core scheduler, which is still running
+				// independently of stopCtx/dispatcher.Stop(), so the core immediately
+				// re-allocates this task and re-triggers UpdateAllocation, which hits this
+				// same canceled context and rolls back again — an unbounded busy loop on the
+				// RM-proxy callback goroutine that Stop() can never interrupt. See YUNIKORN-3369.
+				log.Log(log.ShimRMCallback).Info("AssumePod retry aborted due to context cancellation", zap.Error(err))
+				continue
+			}
+			if wait.Interrupted(err) && lastErr != nil {
+				err = lastErr
+			}
+			// delete the cycle state
+			callback.context.schedulerCache.DeleteCycleState(task.GetTaskPod())
+
 			if task.IsPlaceholder() {
 				// Placeholder tasks do not have volume bindings, so AssumePod failure
 				// is unexpected and unrecoverable; wrap the error with context.
@@ -91,6 +114,9 @@ func (callback *AsyncRMCallback) UpdateAllocation(response *si.AllocationRespons
 		if utils.IsAssignedPod(task.GetTaskPod()) {
 			// task is already bound, fixup state and continue
 			task.MarkPreviouslyAllocated(alloc.AllocationKey, alloc.NodeID)
+
+			// delete the cycle state
+			callback.context.schedulerCache.DeleteCycleState(task.GetTaskPod())
 		} else {
 			ev := NewAllocateTaskEvent(alloc.ApplicationID, task.taskID, alloc.AllocationKey, alloc.NodeID)
 			dispatcher.Dispatch(ev)
@@ -159,7 +185,7 @@ func (callback *AsyncRMCallback) UpdateApplication(response *si.ApplicationRespo
 			zap.String("new status", updated.State))
 		switch updated.State {
 		case ApplicationStates().Completed:
-			callback.context.RemoveApplication(updated.ApplicationID)
+			callback.context.RemoveCompletedApplication(updated.ApplicationID)
 		case ApplicationStates().Resuming:
 			app := callback.context.GetApplication(updated.ApplicationID)
 			if app != nil && app.GetApplicationState() == ApplicationStates().Reserving {
@@ -200,19 +226,16 @@ func (callback *AsyncRMCallback) UpdateNode(response *si.NodeResponse) error {
 	return nil
 }
 
+func (callback *AsyncRMCallback) PreFilterPredicates(args *si.PreFilterPredicatesArgs) *si.PreFilterPredicatesResponse {
+	return callback.context.PreFilter(args.AllocationKey, args.Allocate)
+}
+
 func (callback *AsyncRMCallback) Predicates(args *si.PredicatesArgs) error {
 	return callback.context.IsPodFitNode(args.AllocationKey, args.NodeID, args.Allocate)
 }
 
 func (callback *AsyncRMCallback) PreemptionPredicates(args *si.PreemptionPredicatesArgs) *si.PreemptionPredicatesResponse {
-	index, ok := callback.context.IsPodFitNodeViaPreemption(args.AllocationKey, args.NodeID, args.PreemptAllocationKeys, int(args.StartIndex))
-	if !ok {
-		index = -1
-	}
-	return &si.PreemptionPredicatesResponse{
-		Success: ok,
-		Index:   int32(index), //nolint:gosec
-	}
+	return callback.context.IsPodFitNodeViaPreemption(args.AllocationKey, args.NodeID, args.PreemptAllocationKeys, int(args.StartIndex))
 }
 
 func (callback *AsyncRMCallback) SendEvent(eventRecords []*si.EventRecord) {
@@ -223,7 +246,7 @@ func (callback *AsyncRMCallback) SendEvent(eventRecords []*si.EventRecord) {
 }
 
 func (callback *AsyncRMCallback) UpdateContainerSchedulingState(request *si.UpdateContainerSchedulingStateRequest) {
-	callback.context.HandleContainerStateUpdate(request)
+	callback.context.HandleContainerStateUpdate(callback.stopCtx, request)
 }
 
 // StateDumpPlugin implementation

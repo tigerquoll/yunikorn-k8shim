@@ -19,9 +19,13 @@
 package client
 
 import (
+	"context"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+
+	"github.com/apache/yunikorn-k8shim/pkg/conf"
 )
 
 type KubeClient interface {
@@ -29,32 +33,44 @@ type KubeClient interface {
 	Bind(pod *v1.Pod, hostID string) error
 
 	// Create a pod
-	Create(pod *v1.Pod) (*v1.Pod, error)
+	Create(ctx context.Context, pod *v1.Pod) (*v1.Pod, error)
 
 	// Delete a pod from a host
-	Delete(pod *v1.Pod) error
-
-	// Update a pod
-	UpdatePod(pod *v1.Pod, podMutator func(pod *v1.Pod)) (*v1.Pod, error)
+	Delete(ctx context.Context, pod *v1.Pod) error
 
 	// Update the status of a pod
-	UpdateStatus(pod *v1.Pod) (*v1.Pod, error)
-
-	// Get a pod
-	Get(podNamespace string, podName string) (*v1.Pod, error)
+	UpdateStatus(ctx context.Context, pod *v1.Pod) (*v1.Pod, error)
 
 	// minimal expose this, only informers factory needs it
 	GetClientSet() kubernetes.Interface
 
-	GetConfigs() *rest.Config
-
 	GetConfigMap(namespace string, name string) (*v1.ConfigMap, error)
 }
 
+// NewKubeClient creates the scheduler client: it carries the scheduling actions and backs
+// the informers. The kubernetes.qps and kubernetes.burst policy from the scheduler
+// configuration applies, so the client must be created after the configmaps are loaded.
 func NewKubeClient(kc string) KubeClient {
-	return newSchedulerKubeClient(kc)
+	schedulerConf := conf.GetSchedulerConf()
+	return newKubeClient(kc, schedulerConf.KubeQPS, schedulerConf.KubeBurst, userAgentScheduler)
 }
 
-func NewBootstrapKubeClient(kc string) KubeClient {
-	return newBootstrapSchedulerKubeClient(kc)
+// NewAdmissionControllerKubeClient creates the admission controller client. It runs on the
+// client-go defaults: its traffic is three small informers and the occasional webhook or
+// secret write.
+func NewAdmissionControllerKubeClient(kc string) KubeClient {
+	return newKubeClient(kc, 0, 0, userAgentAdmissionController)
+}
+
+// newEventsRestConfig creates the REST config of the events client. It has its own client
+// side limiter, built from the same kubernetes.qps and kubernetes.burst as the scheduler client,
+// so events do not take tokens away from the scheduling traffic.
+func newEventsRestConfig(kc string, schedulerConf *conf.SchedulerConf) *rest.Config {
+	return newRestConfig(kc, schedulerConf.KubeQPS, schedulerConf.KubeBurst, userAgentEvents)
+}
+
+// NewEventsClient creates the client the event broadcaster writes through. It must be created
+// after the configmaps are loaded.
+func NewEventsClient(kc string) kubernetes.Interface {
+	return newClientSetOrDie(newEventsRestConfig(kc, conf.GetSchedulerConf()))
 }

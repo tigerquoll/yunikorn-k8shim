@@ -19,6 +19,7 @@
 package shim
 
 import (
+	gocontext "context"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,7 @@ import (
 
 	"gotest.tools/v3/assert"
 	v1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	apis "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,6 +38,7 @@ import (
 	"github.com/apache/yunikorn-k8shim/pkg/common/constants"
 	"github.com/apache/yunikorn-k8shim/pkg/common/test"
 	"github.com/apache/yunikorn-k8shim/pkg/common/utils"
+	"github.com/apache/yunikorn-k8shim/pkg/conf"
 	"github.com/apache/yunikorn-scheduler-interface/lib/go/api"
 	siCommon "github.com/apache/yunikorn-scheduler-interface/lib/go/common"
 	"github.com/apache/yunikorn-scheduler-interface/lib/go/si"
@@ -173,7 +176,7 @@ func TestSchedulerRegistrationFailed(t *testing.T) {
 		})
 
 	ctx := cache.NewContext(mockedAPIProvider)
-	shim := newShimSchedulerInternal(ctx, mockedAPIProvider, callback)
+	shim := newShimSchedulerInternal(ctx, mockedAPIProvider, callback, func() {})
 	assert.Error(t, shim.Run(), "some error")
 	assertStopChannelClosed(t, shim)
 
@@ -183,7 +186,7 @@ func TestSchedulerRegistrationFailed(t *testing.T) {
 
 func TestSchedulerStopClosesStopChannel(t *testing.T) {
 	mockedAPIProvider := client.NewMockedAPIProvider(false)
-	shim := newShimSchedulerInternal(cache.NewContext(mockedAPIProvider), mockedAPIProvider, nil)
+	shim := newShimSchedulerInternal(cache.NewContext(mockedAPIProvider), mockedAPIProvider, nil, func() {})
 
 	shim.Stop()
 	assertStopChannelClosed(t, shim)
@@ -195,7 +198,7 @@ func TestSchedulerStopClosesStopChannel(t *testing.T) {
 func TestSchedulerStopStopsAPIFactory(t *testing.T) {
 	mockedAPIProvider := client.NewMockedAPIProvider(false)
 	apiProvider := &trackingAPIProvider{APIProvider: mockedAPIProvider}
-	shim := newShimSchedulerInternal(cache.NewContext(apiProvider), apiProvider, nil)
+	shim := newShimSchedulerInternal(cache.NewContext(apiProvider), apiProvider, nil, func() {})
 
 	shim.Stop()
 	assert.Check(t, apiProvider.stopped.Load(), "API provider should be stopped with the scheduler")
@@ -203,6 +206,44 @@ func TestSchedulerStopStopsAPIFactory(t *testing.T) {
 	shim.Stop()
 }
 
+func TestSchedulingLoopsShutdownOnStop(t *testing.T) {
+	cluster := MockScheduler{}
+	cluster.init()
+	assert.NilError(t, cluster.start(), "failed to start cluster")
+	assert.Check(t, cluster.started.Load(), "cluster should be started")
+
+	// Ensure both scheduling loops are active
+	err := utils.WaitForCondition(func() bool {
+		return utils.CountGoroutines("(*KubernetesShim).doScheduling") == 2
+	}, 10*time.Millisecond, 5*time.Second)
+	assert.NilError(t, err, "both scheduling loops should be running after cluster start")
+
+	// Verify stop terminates both scheduling loops
+	cluster.stop()
+	err = utils.WaitForCondition(func() bool {
+		return utils.CountGoroutines("(*KubernetesShim).doScheduling") == 0
+	}, 10*time.Millisecond, 5*time.Second)
+	assert.NilError(t, err, "both scheduling loops should terminate when scheduler is stopped")
+}
+
+func TestNewCallbackWithCancel(t *testing.T) {
+	mockedAPIProvider := client.NewMockedAPIProvider(false)
+	shimCtx := cache.NewContext(mockedAPIProvider)
+
+	callback, cancel := newCallbackWithCancel(shimCtx)
+	assert.Assert(t, callback != nil, "expected a non-nil callback")
+	assert.Assert(t, cancel != nil, "expected a non-nil cancel func")
+	cancel() // must be safe to invoke
+}
+
+func TestSchedulerNilCancelCallbacksFallsBackToNoop(t *testing.T) {
+	mockedAPIProvider := client.NewMockedAPIProvider(false)
+	shim := newShimSchedulerInternal(cache.NewContext(mockedAPIProvider), mockedAPIProvider, nil, nil)
+
+	assert.Assert(t, shim.cancelCallbacks != nil, "nil cancelCallbacks must fall back to a no-op")
+	shim.cancelCallbacks() // must not panic
+	shim.Stop()            // Stop() invokes cancelCallbacks(); must not panic either
+}
 func assertStopChannelClosed(t *testing.T, shim *KubernetesShim) {
 	t.Helper()
 	select {
@@ -322,6 +363,53 @@ func TestAssumePodError(t *testing.T) {
 		"task must be in Scheduling state while AssumePod retries are in flight")
 	assert.Equal(t, 0, len(cluster.GetBoundPods(false)),
 		"no pods should be bound when AssumePod always fails")
+}
+
+// TestAssumePodError_AbortsOnShutdown verifies that Stop() interrupts the
+// AssumePod retry loop instead of letting it run out its full 30-step,
+// ~29s backoff after shutdown.
+func TestAssumePodError_AbortsOnShutdown(t *testing.T) {
+	cluster := MockScheduler{}
+	cluster.init()
+	binder := test.NewVolumeBinderMock()
+	binder.EnableVolumeClaimsError("unable to get volume claims")
+	cluster.apiProvider.SetVolumeBinder(binder)
+	assert.NilError(t, cluster.start(), "failed to start cluster")
+
+	err := cluster.updateConfig(configData, nil)
+	assert.NilError(t, err, "update config failed")
+	addNode(&cluster, "node-1")
+
+	taskResource := common.NewResourceBuilder().
+		AddResource(siCommon.Memory, 1000).
+		AddResource(siCommon.CPU, 1).
+		Build()
+	pod1 := createTestPod("root.a", "app0001", "task0001", taskResource)
+	cluster.AddPod(pod1)
+
+	// wait until the retry loop has made repeated attempts, proving it is
+	// actively blocking the RM callback goroutine on the 1s-per-step backoff
+	err = utils.WaitForCondition(func() bool {
+		return binder.GetVolumeClaimsCallCount() >= 2
+	}, 100*time.Millisecond, 10*time.Second)
+	assert.NilError(t, err, "AssumePod retry never made repeated attempts")
+
+	countAtStop := binder.GetVolumeClaimsCallCount()
+	cluster.stop()
+
+	// at most the single attempt already in flight when Stop() ran may still land
+	err = utils.WaitForCondition(func() bool {
+		return binder.GetVolumeClaimsCallCount() <= countAtStop+1
+	}, 50*time.Millisecond, time.Second)
+	assert.NilError(t, err, "AssumePod made more than one additional attempt after shim.Stop()")
+
+	settledCount := binder.GetVolumeClaimsCallCount()
+	// the pre-fix backoff retries roughly once per second; wait more than a
+	// full step to prove the loop actually exited rather than merely being
+	// mid-sleep
+	time.Sleep(2 * time.Second)
+	assert.Equal(t, settledCount, binder.GetVolumeClaimsCallCount(),
+		"AssumePod kept retrying after shim.Stop(); the retry loop did not abort on shutdown")
 }
 
 func TestForeignPodTracking(t *testing.T) {
@@ -445,5 +533,69 @@ func createTestPod(queue string, appID string, taskID string, taskResource *si.R
 		Status: v1.PodStatus{
 			Phase: v1.PodPending,
 		},
+	}
+}
+
+type capturingSink struct {
+	created chan *eventsv1.Event
+}
+
+func (s *capturingSink) Create(_ gocontext.Context, e *eventsv1.Event) (*eventsv1.Event, error) {
+	s.created <- e
+	return e, nil
+}
+
+func (s *capturingSink) Update(_ gocontext.Context, e *eventsv1.Event) (*eventsv1.Event, error) {
+	return e, nil
+}
+
+func (s *capturingSink) Patch(_ gocontext.Context, e *eventsv1.Event, _ []byte) (*eventsv1.Event, error) {
+	return e, nil
+}
+
+// the recorder the shim installs must apply the event level filter before the broadcaster
+func TestNewEventRecorderFilters(t *testing.T) {
+	original := conf.GetSchedulerConf()
+	defer conf.SetSchedulerConf(original)
+	c := conf.CreateDefaultConfig()
+	c.KubeEventLevel = conf.EventLevelWarning
+	conf.SetSchedulerConf(c)
+
+	sink := &capturingSink{created: make(chan *eventsv1.Event, 10)}
+	stop, cancel := gocontext.WithCancel(gocontext.Background())
+	recorder, broadcaster, err := newEventRecorder(stop, sink)
+	assert.NilError(t, err)
+	t.Cleanup(func() {
+		cancel()
+		broadcaster.Shutdown()
+	})
+
+	pod := &v1.Pod{ObjectMeta: apis.ObjectMeta{Name: "pod", Namespace: "default", UID: "uid-1"}}
+	recorder.Eventf(pod, nil, v1.EventTypeNormal, "Scheduled", "Scheduled", "normal")
+	recorder.Eventf(pod, nil, v1.EventTypeWarning, "PodUnschedulable", "PodUnschedulable", "warning")
+
+	// each event is delivered on its own goroutine: wait for the Warning, then keep listening
+	var received []*eventsv1.Event
+	for warned := false; !warned; {
+		select {
+		case e := <-sink.created:
+			received = append(received, e)
+			warned = e.Type == v1.EventTypeWarning
+		case <-time.After(10 * time.Second):
+			t.Fatal("the Warning event did not reach the sink")
+		}
+	}
+	window := time.After(200 * time.Millisecond)
+collect:
+	for {
+		select {
+		case e := <-sink.created:
+			received = append(received, e)
+		case <-window:
+			break collect
+		}
+	}
+	for _, e := range received {
+		assert.Equal(t, v1.EventTypeWarning, e.Type, "the Normal event must be filtered out")
 	}
 }

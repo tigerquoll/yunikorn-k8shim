@@ -19,12 +19,14 @@
 package cache
 
 import (
-	"strings"
+	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/apache/yunikorn-k8shim/pkg/client"
 	"github.com/apache/yunikorn-k8shim/pkg/locking"
@@ -38,11 +40,16 @@ type PlaceholderManager struct {
 	// when the placeholder manager is unable to delete a pod,
 	// this pod becomes to be an "orphan" pod. We add them to a map
 	// and keep retrying deleting them in order to avoid wasting resources.
-	orphanPods  map[string]*v1.Pod
-	stopChan    chan struct{}
-	running     atomic.Bool
-	cleanupTime time.Duration
-	// a simple mutex will do we do not have separate read and write paths
+	orphanPods map[string]*v1.Pod
+	// closed when the cleanup loop exits so Stop can wait for shutdown to complete
+	doneChan     chan struct{}
+	started      atomic.Bool
+	cancel       context.CancelFunc
+	lifecycleCtx context.Context
+	cleanupTime  time.Duration
+	// tracks operations admitted under the manager lock before cancellation
+	operations sync.WaitGroup
+	// protects orphanPods, lifecycle state and cleanupTime
 	locking.RWMutex
 }
 
@@ -54,11 +61,14 @@ var (
 func NewPlaceholderManager(clients *client.Clients) *PlaceholderManager {
 	mu.Lock()
 	defer mu.Unlock()
+	lifecycleCtx, cancel := context.WithCancel(context.Background())
 	placeholderMgr = &PlaceholderManager{
-		clients:     clients,
-		orphanPods:  make(map[string]*v1.Pod),
-		stopChan:    make(chan struct{}),
-		cleanupTime: 5 * time.Second,
+		clients:      clients,
+		orphanPods:   make(map[string]*v1.Pod),
+		doneChan:     make(chan struct{}),
+		lifecycleCtx: lifecycleCtx,
+		cancel:       cancel,
+		cleanupTime:  5 * time.Second,
 	}
 	return placeholderMgr
 }
@@ -70,51 +80,113 @@ func getPlaceholderManager() *PlaceholderManager {
 }
 
 func (mgr *PlaceholderManager) createAppPlaceholders(app *Application) error {
-	mgr.Lock()
-	defer mgr.Unlock()
+	ctx, kubeClient := mgr.beginOperation()
+	if kubeClient == nil {
+		return ctx.Err()
+	}
+	defer mgr.operations.Done()
 
 	// map task group to count of already created placeholders
 	tgCounts := make(map[string]int32)
-	for _, ph := range app.getPlaceHolderTasks() {
+	for _, ph := range app.GetPlaceHolderTasks() {
 		tgCounts[ph.GetTaskGroupName()]++
 	}
+
+	// track the pods created in this attempt so they can be rolled back if a later
+	// create fails; these placeholders may not be in the task map yet, so cleanUp
+	// would not catch them
+	var createdPods []*v1.Pod
 
 	// iterate all task groups, create placeholders for all the min members
 	for _, tg := range app.getTaskGroups() {
 		count := tgCounts[tg.Name]
 		// only create missing pods for each task group
 		for i := count; i < tg.MinMember; i++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			placeholderName := GeneratePlaceholderName(tg.Name, app.GetApplicationID())
 			placeholder := newPlaceholder(placeholderName, app, tg)
 			// create the placeholder on K8s
-			_, err := mgr.clients.KubeClient.Create(placeholder.pod)
+			created, err := kubeClient.Create(ctx, placeholder.pod)
 			if err != nil {
 				log.Log(log.ShimCachePlaceholder).Error("failed to create placeholder pod",
 					zap.Error(err))
+				// roll back the placeholders already created in this attempt so a
+				// partially created gang does not leak pods when creation fails midway
+				mgr.deletePlaceholderPods(ctx, kubeClient, createdPods...)
 				return err
 			}
 			log.Log(log.ShimCachePlaceholder).Info("placeholder created",
 				zap.Stringer("placeholder", placeholder))
+			// keep the pod returned by the API server; it carries the UID used for
+			// orphan tracking if the rollback delete later fails
+			createdPods = append(createdPods, created)
 		}
 	}
 
 	return nil
 }
 
+// deletePlaceholderPods best-effort deletes placeholder pods created during a failed
+// createAppPlaceholders attempt. It mirrors cleanUp: pods that cannot be deleted (other
+// than already-gone pods) are tracked as orphans so the cleanup loop retries them. The
+// caller passes the context and client obtained from beginOperation so the delete honors
+// the manager lifecycle.
+func (mgr *PlaceholderManager) deletePlaceholderPods(ctx context.Context, kubeClient client.KubeClient, pods ...*v1.Pod) {
+	if len(pods) == 0 {
+		return
+	}
+	orphans := make(map[string]*v1.Pod)
+	defer mgr.addOrphanPods(orphans)
+	for _, pod := range pods {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := kubeClient.Delete(ctx, pod); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if !apierrors.IsNotFound(err) {
+				log.Log(log.ShimCachePlaceholder).Warn("failed to roll back placeholder pod",
+					zap.String("podName", pod.Name),
+					zap.Error(err))
+				orphans[string(pod.UID)] = pod
+			}
+			continue
+		}
+		log.Log(log.ShimCachePlaceholder).Info("placeholder pod rolled back",
+			zap.String("namespace", pod.Namespace),
+			zap.String("podName", pod.Name))
+	}
+}
+
 // clean up all the placeholders for an application
 func (mgr *PlaceholderManager) cleanUp(app *Application) {
-	mgr.Lock()
-	defer mgr.Unlock()
+	ctx, kubeClient := mgr.beginOperation()
+	if kubeClient == nil {
+		return
+	}
+	defer mgr.operations.Done()
+	orphans := make(map[string]*v1.Pod)
+	defer mgr.addOrphanPods(orphans)
+
 	log.Log(log.ShimCachePlaceholder).Info("start to clean up app placeholders",
 		zap.String("appID", app.GetApplicationID()))
 	for _, task := range app.GetPlaceHolderTasks() {
+		if ctx.Err() != nil {
+			return
+		}
 		// remove pod
-		err := mgr.clients.KubeClient.Delete(task.GetTaskPod())
+		err := kubeClient.Delete(ctx, task.GetTaskPod())
 		if err != nil {
-			log.Log(log.ShimCachePlaceholder).Warn("failed to clean up placeholder pod",
-				zap.Error(err))
-			if !strings.Contains(err.Error(), "not found") {
-				mgr.orphanPods[task.GetTaskID()] = task.GetTaskPod()
+			if ctx.Err() != nil {
+				return
+			}
+			if !apierrors.IsNotFound(err) {
+				log.Log(log.ShimCachePlaceholder).Warn("failed to clean up placeholder pod",
+					zap.Error(err))
+				orphans[task.GetTaskID()] = task.GetTaskPod()
 			}
 		}
 	}
@@ -122,38 +194,91 @@ func (mgr *PlaceholderManager) cleanUp(app *Application) {
 		zap.String("appID", app.GetApplicationID()))
 }
 
-func (mgr *PlaceholderManager) cleanOrphanPlaceholders() {
+func (mgr *PlaceholderManager) cleanUpAsync(app *Application) {
+	if !mgr.started.Load() {
+		log.Log(log.ShimCachePlaceholder).Info("PlaceholderManager is not running, skipping application cleanup")
+		return
+	}
+	// The operation checks cancellation even if scheduled after Stop returns.
+	go mgr.cleanUp(app)
+}
+
+// beginOperation snapshots the shared context and client and registers work before
+// Stop can cancel the context and wait. Canceled operations are not registered.
+func (mgr *PlaceholderManager) beginOperation() (context.Context, client.KubeClient) {
+	mgr.RLock()
+	defer mgr.RUnlock()
+	ctx := mgr.lifecycleCtx
+	if ctx.Err() != nil {
+		return ctx, nil
+	}
+	mgr.operations.Add(1)
+	return ctx, mgr.clients.KubeClient
+}
+
+func (mgr *PlaceholderManager) addOrphanPods(pods map[string]*v1.Pod) {
+	if len(pods) == 0 {
+		return
+	}
 	mgr.Lock()
 	defer mgr.Unlock()
-	for taskID, pod := range mgr.orphanPods {
+	for taskID, pod := range pods {
+		mgr.orphanPods[taskID] = pod
+	}
+}
+
+func (mgr *PlaceholderManager) cleanOrphanPlaceholders() {
+	ctx, kubeClient := mgr.beginOperation()
+	if kubeClient == nil {
+		return
+	}
+	defer mgr.operations.Done()
+	mgr.Lock()
+	orphans := mgr.orphanPods
+	mgr.orphanPods = make(map[string]*v1.Pod)
+	mgr.Unlock()
+	defer mgr.addOrphanPods(orphans)
+
+	for taskID, pod := range orphans {
+		if ctx.Err() != nil {
+			return
+		}
 		log.Log(log.ShimCachePlaceholder).Debug("start to clean up orphan pod",
 			zap.String("taskID", taskID),
 			zap.String("podName", pod.Name))
-		err := mgr.clients.KubeClient.Delete(pod)
-		if err != nil {
+		if err := kubeClient.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 			log.Log(log.ShimCachePlaceholder).Warn("failed to clean up orphan pod", zap.Error(err))
 		} else {
-			delete(mgr.orphanPods, taskID)
+			delete(orphans, taskID)
 		}
 	}
 }
 
 func (mgr *PlaceholderManager) Start() {
-	if mgr.isRunning() {
+	mgr.Lock()
+	defer mgr.Unlock()
+	// The shared context and completion channel belong to a single lifecycle.
+	if mgr.lifecycleCtx.Err() != nil {
+		log.Log(log.ShimCachePlaceholder).Info("PlaceholderManager has already stopped")
+		return
+	}
+	if !mgr.started.CompareAndSwap(false, true) {
 		log.Log(log.ShimCachePlaceholder).Info("PlaceholderManager is already started")
 		return
 	}
 	log.Log(log.ShimCachePlaceholder).Info("starting the PlaceholderManager")
-	mgr.setRunning(true)
 	go func() {
-		// clean orphan placeholders approximately every 5 seconds
+		ticker := time.NewTicker(mgr.getCleanupTime())
+		defer func() {
+			log.Log(log.ShimCachePlaceholder).Info("PlaceholderManager has been stopped")
+			// Closing signals completion to the Stop call that initiated shutdown.
+			close(mgr.doneChan)
+		}()
 		for {
 			select {
-			case <-mgr.stopChan:
-				mgr.setRunning(false)
-				log.Log(log.ShimCachePlaceholder).Info("PlaceholderManager has been stopped")
+			case <-mgr.lifecycleCtx.Done():
 				return
-			case <-time.After(mgr.getCleanupTime()):
+			case <-ticker.C:
 				mgr.cleanOrphanPlaceholders()
 			}
 		}
@@ -161,20 +286,18 @@ func (mgr *PlaceholderManager) Start() {
 }
 
 func (mgr *PlaceholderManager) Stop() {
-	if !mgr.isRunning() {
+	mgr.Lock()
+	if !mgr.started.CompareAndSwap(true, false) {
+		mgr.Unlock()
 		log.Log(log.ShimCachePlaceholder).Info("PlaceholderManager already stopped")
 		return
 	}
 	log.Log(log.ShimCachePlaceholder).Info("stopping the PlaceholderManager")
-	mgr.stopChan <- struct{}{}
-}
-
-func (mgr *PlaceholderManager) isRunning() bool {
-	return mgr.running.Load()
-}
-
-func (mgr *PlaceholderManager) setRunning(flag bool) {
-	mgr.running.Store(flag)
+	mgr.cancel()
+	mgr.Unlock()
+	// Cancellation prevents further registration before waiting for active work.
+	mgr.operations.Wait()
+	<-mgr.doneChan
 }
 
 func (mgr *PlaceholderManager) getOrphanPodsLength() int {

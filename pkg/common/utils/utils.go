@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -143,14 +144,30 @@ func GetApplicationIDFromPod(pod *v1.Pod) string {
 	if strings.Compare(pod.Spec.SchedulerName, constants.SchedulerName) != 0 {
 		return ""
 	}
+	appID := GetApplicationIDValue(pod)
 
-	// Application ID can be defined in multiple places
-	// The application ID is determined by the following order.
-	// 1. Label: constants.CanonicalLabelApplicationID
-	// 2. Annotation: constants.AnnotationApplicationID
-	// 3. Label: constants.LabelApplicationID
-	// 4. Label: constants.SparkLabelAppID
+	// does appID end with '-uniqueautogen' if it does replace suffix with pod UID
+	if before, ok := strings.CutSuffix(appID, uniqueAutogenSuffix); ok {
+		appID = fmt.Sprintf("%s-%s", before, string(pod.UID))
+	}
 
+	// if app ID is not empty, return it
+	if appID != "" {
+		return appID
+	}
+
+	// Standard deployment mode, so we need a valid Application ID to proceed. Generate one now.
+	return GenerateApplicationID(pod.Namespace, conf.GetSchedulerConf().GenerateUniqueAppIds, string(pod.UID))
+}
+
+// GetApplicationIDValue retrieves the application ID from the pod based on the predefined order
+// Application ID can be defined in multiple places
+// The application ID is determined by the following order.
+// 1. Label: constants.CanonicalLabelApplicationID
+// 2. Annotation: constants.AnnotationApplicationID
+// 3. Label: constants.LabelApplicationID
+// 4. Label: constants.SparkLabelAppID
+func GetApplicationIDValue(pod *v1.Pod) string {
 	appID := GetPodLabelValue(pod, constants.CanonicalLabelApplicationID)
 
 	if appID == "" {
@@ -169,22 +186,11 @@ func GetApplicationIDFromPod(pod *v1.Pod) string {
 			}
 		}
 	}
-
-	// does appID end with '-uniqueautogen'?
-	if strings.HasSuffix(appID, uniqueAutogenSuffix) {
-		// replace suffix with pod UID
-		appID = fmt.Sprintf("%s-%s", strings.TrimSuffix(appID, uniqueAutogenSuffix), string(pod.UID))
-	}
-
-	// if app ID is not empty, return it
-	if appID != "" {
-		return appID
-	}
-
-	// Standard deployment mode, so we need a valid Application ID to proceed. Generate one now.
-	return GenerateApplicationID(pod.Namespace, conf.GetSchedulerConf().GenerateUniqueAppIds, string(pod.UID))
+	return appID
 }
 
+// GetIgnoredLabelAnnotationInPod returns the labels and annotations keys and values that set a different value than
+// the one currently used. Reporting inconsistencies for values that can be set in multiple ways.
 func GetIgnoredLabelAnnotationInPod(pod *v1.Pod, currentValue string, labelKeys []string, annotationKeys []string) (map[string]string, map[string]string) {
 	ignoredLabel := make(map[string]string, 0)
 	ignoredAnnotation := make(map[string]string, 0)
@@ -301,6 +307,21 @@ func WaitForCondition(eval func() bool, interval time.Duration, timeout time.Dur
 	}
 }
 
+// CountGoroutines returns the number of active goroutines whose stack trace contains the given pattern.
+func CountGoroutines(pattern string) int {
+	if pattern == "" {
+		return 0
+	}
+	buf := make([]byte, 1024)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return strings.Count(string(buf[:n]), pattern)
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
 // merge two string maps
 // if the same key defined in the first and second maps
 // the value will be set by the second map
@@ -393,7 +414,23 @@ func GetTaskGroupFromPodSpec(pod *v1.Pod) string {
 	return GetPodAnnotationValue(pod, constants.AnnotationTaskGroupName)
 }
 
+// GetPlaceholderFlagFromPodSpec validates the placeholder annotation against the
+// task group and the single Pod owner with Controller explicitly set to false
+// used by generated placeholders.
+// Placeholders are ignored when gang scheduling is disabled.
+// Invalid flags are ignored without changing the pod. These structural checks do
+// not authenticate the owner: user-supplied metadata can still imitate a placeholder.
 func GetPlaceholderFlagFromPodSpec(pod *v1.Pod) bool {
+	if conf.GetSchedulerConf().DisableGangScheduling {
+		return false
+	}
+	if GetTaskGroupFromPodSpec(pod) == "" || len(pod.OwnerReferences) != 1 {
+		return false
+	}
+	owner := pod.OwnerReferences[0]
+	if owner.Kind != "Pod" || owner.Controller == nil || *owner.Controller {
+		return false
+	}
 	if value := GetPodAnnotationValue(pod, constants.AnnotationPlaceholderFlag); value != "" {
 		if v, err := strconv.ParseBool(value); err == nil {
 			return v

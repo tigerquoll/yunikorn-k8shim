@@ -39,6 +39,7 @@ import (
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -76,6 +77,8 @@ const (
 	ReplicaSet  = "ReplicaSet"
 	Job         = "Job"
 	CronJob     = "CronJob"
+	cpu         = "cpu"
+	memory      = "memory"
 )
 
 var fw *portforward.PortForwarder
@@ -760,7 +763,7 @@ func (k *KubeCtl) UpdateConfigMap(cMap *v1.ConfigMap, namespace string) (*v1.Con
 }
 
 func (k *KubeCtl) StartConfigMapInformer(namespace string, stopChan <-chan struct{}, eventHandler cache.ResourceEventHandler) error {
-	informerFactory := informers.NewSharedInformerFactoryWithOptions(k.clientSet, 0, informers.WithNamespace(namespace))
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(k.clientSet, 0, informers.WithNamespace(namespace), informers.WithTransform(stripManagedFields()))
 	informerFactory.Start(stopChan)
 	configMapInformer := informerFactory.Core().V1().ConfigMaps()
 	_, err := configMapInformer.Informer().AddEventHandler(eventHandler)
@@ -776,6 +779,17 @@ func (k *KubeCtl) StartConfigMapInformer(namespace string, stopChan <-chan struc
 	}
 
 	return nil
+}
+
+// stripManagedFields removes the managed fields from objects received by the informers as we do not need them.
+// If any future code relies on the managed fields to be available this might need adjustments.
+func stripManagedFields() cache.TransformFunc {
+	return func(in any) (any, error) {
+		if obj, err := meta.Accessor(in); err == nil && obj.GetManagedFields() != nil {
+			obj.SetManagedFields(nil)
+		}
+		return in, nil
+	}
 }
 
 func (k *KubeCtl) DeleteConfigMap(cName string, namespace string) error {
@@ -810,8 +824,8 @@ func (k *KubeCtl) CreateDeployment(deployment *appsv1.Deployment, namespace stri
 	return k.clientSet.AppsV1().Deployments(namespace).Create(context.TODO(), deployment, metav1.CreateOptions{})
 }
 
-func (k *KubeCtl) CreateStatefulSet(stetafulSet *appsv1.StatefulSet, namespace string) (*appsv1.StatefulSet, error) {
-	return k.clientSet.AppsV1().StatefulSets(namespace).Create(context.TODO(), stetafulSet, metav1.CreateOptions{})
+func (k *KubeCtl) CreateStatefulSet(statefulSet *appsv1.StatefulSet, namespace string) (*appsv1.StatefulSet, error) {
+	return k.clientSet.AppsV1().StatefulSets(namespace).Create(context.TODO(), statefulSet, metav1.CreateOptions{})
 }
 
 func (k *KubeCtl) CreateReplicaSet(replicaSet *appsv1.ReplicaSet, namespace string) (*appsv1.ReplicaSet, error) {
@@ -1106,20 +1120,33 @@ func (k *KubeCtl) ListPodsByLabelSelector(namespace string, selector string) (*v
 }
 
 // Wait up to timeout seconds for all pods in 'namespace' with given 'selector' to enter running state.
-// Returns an error if no pods are found or not all discovered pods enter running state.
+// Returns an error with namespace, selector, and timeout details if polling fails.
 func (k *KubeCtl) WaitForPodBySelectorRunning(namespace string, selector string, timeout int) error {
-	podList, err := k.ListPods(namespace, selector)
+	timeoutDuration := time.Duration(timeout) * time.Second
+	err := wait.PollUntilContextTimeout(
+		context.TODO(),
+		500*time.Millisecond,
+		timeoutDuration,
+		true,
+		func(ctx context.Context) (bool, error) {
+			podList, listErr := k.ListPods(namespace, selector)
+			if listErr != nil {
+				return false, listErr
+			}
+			if len(podList.Items) == 0 {
+				return false, nil
+			}
+			for _, pod := range podList.Items {
+				if pod.Status.Phase != v1.PodRunning {
+					return false, nil
+				}
+			}
+			return true, nil
+		},
+	)
 	if err != nil {
-		return err
-	}
-	if len(podList.Items) == 0 {
-		return fmt.Errorf("no pods in %s with selector %s", namespace, selector)
-	}
-
-	for _, pod := range podList.Items {
-		if err := k.WaitForPodRunning(namespace, pod.Name, time.Duration(timeout)*time.Second); err != nil {
-			return err
-		}
+		return fmt.Errorf("waiting for all pods to be Running in namespace %q with selector %q (timeout %s): %w",
+			namespace, selector, timeoutDuration, err)
 	}
 	return nil
 }

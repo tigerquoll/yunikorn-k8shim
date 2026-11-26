@@ -192,15 +192,11 @@ func (task *Task) GetNodeName() string {
 }
 
 func (task *Task) DeleteTaskPod() error {
-	return task.context.apiProvider.GetAPIs().KubeClient.Delete(task.GetTaskPod())
+	return task.context.apiProvider.GetAPIs().KubeClient.Delete(context.Background(), task.GetTaskPod())
 }
 
 func (task *Task) UpdateTaskPodStatus(pod *v1.Pod) (*v1.Pod, error) {
-	return task.context.apiProvider.GetAPIs().KubeClient.UpdateStatus(pod)
-}
-
-func (task *Task) UpdateTaskPod(pod *v1.Pod, podMutator func(pod *v1.Pod)) (*v1.Pod, error) {
-	return task.context.apiProvider.GetAPIs().KubeClient.UpdatePod(pod, podMutator)
+	return task.context.apiProvider.GetAPIs().KubeClient.UpdateStatus(context.TODO(), pod)
 }
 
 func (task *Task) isTerminated() bool {
@@ -242,15 +238,7 @@ func (task *Task) IsOriginator() bool {
 }
 
 func (task *Task) isPreemptSelfAllowed() bool {
-	value := utils.GetPodAnnotationValue(task.pod, constants.AnnotationAllowPreemption)
-	switch value {
-	case constants.True:
-		return true
-	case constants.False:
-		return false
-	default:
-		return task.context.IsPreemptSelfAllowed(task.pod.Spec.PriorityClassName)
-	}
+	return task.context.IsPodPreemptSelfAllowed(task.pod)
 }
 
 func (task *Task) isPreemptOtherAllowed() bool {
@@ -305,13 +293,13 @@ func (task *Task) handleSubmitTaskEvent() {
 
 	if !utils.PodAlreadyBound(task.pod) {
 		// if this is a new request, add events to pod
-		events.GetRecorder().Eventf(task.pod.DeepCopy(), nil, v1.EventTypeNormal, "Scheduling", "Scheduling",
+		events.GetRecorder().Eventf(task.pod.DeepCopy(), nil, v1.EventTypeNormal, events.ReasonScheduling, events.ReasonScheduling,
 			"%s is queued and waiting for allocation", task.alias)
 		// if this task belongs to a task group, that means the app has gang scheduling enabled
 		// in this case, post an event to indicate the task is being gang scheduled
 		if !task.placeholder && task.taskGroupName != "" {
 			events.GetRecorder().Eventf(task.pod.DeepCopy(), nil,
-				v1.EventTypeNormal, "GangScheduling", "TaskGroupMatch",
+				v1.EventTypeNormal, events.ReasonGangScheduling, events.ActionTaskGroupMatch,
 				"Pod belongs to the taskGroup %s, it will be scheduled as a gang member", task.taskGroupName)
 		}
 	}
@@ -370,29 +358,66 @@ func (task *Task) postTaskAllocated() {
 		// once all task related operations are done, release the lock
 		// This is important specially while calling rollbackAllocation, which needs to acquire the context lock, so we cannot hold the task lock while calling it.
 		task.lock.Lock()
-		// before binding pod to node, first bind volumes to pod
-		log.Log(log.ShimCacheTask).Debug("bind pod volumes",
-			zap.String("podName", pod.Name),
-			zap.String("podUID", string(pod.UID)))
-		if err := retry.OnError(retryBackoff, func(err error) bool {
-			if strings.HasPrefix(err.Error(), "binding volumes:") {
-				log.Log(log.ShimCacheTask).Warn("bind volumes to pod failed due to volume binding error, stopping retries",
-					zap.String("taskID", task.taskID), zap.Error(err))
-				return false
+
+		// delete the cycle state
+		defer task.context.schedulerCache.DeleteCycleState(pod)
+
+		// Perform DRA Bindings
+		hasDRABindings := false
+		if len(pod.Spec.ResourceClaims) > 0 {
+			log.Log(log.ShimCacheTask).Debug("dra bindings",
+				zap.String("podName", pod.Name),
+				zap.String("podUID", string(pod.UID)),
+				zap.String("node", nodeName))
+			reserve := task.context.reserve(string(pod.UID), nodeName)
+			reschedule := reserve
+			if reschedule {
+				preBind := task.context.preBind(string(pod.UID), nodeName)
+				reschedule = preBind
+				if !reschedule {
+					task.context.unreserve(string(pod.UID), nodeName)
+				}
+				hasDRABindings = true
 			}
-			log.Log(log.ShimCacheTask).Error("bind volumes to pod failed, retrying",
-				zap.String("taskID", task.taskID), zap.Error(err))
-			return true
-		}, func() error {
-			return task.context.bindPodVolumes(pod)
-		}); err != nil {
-			log.Log(log.ShimCacheTask).Error("bind volumes to pod failed after retries",
-				zap.String("taskID", task.taskID), zap.Error(err))
-			// release task lock before calling rescheduleOnBindFailure to avoid deadlock
-			task.lock.Unlock()
-			task.rescheduleOnBindFailure(allocationKey, nodeName, "PodVolumesBindFailure",
-				fmt.Sprintf("Failed to bind volumes for %s on node %s, it will be retried", alias, nodeName))
-			return
+			if !reschedule {
+				// release task lock before calling rescheduleOnBindFailure to avoid deadlock
+				task.lock.Unlock()
+				task.rescheduleOnBindFailure(allocationKey, nodeName, "PodDRABindFailure",
+					fmt.Sprintf("Failed to bind dra for %s on node %s, it will be retried", alias, nodeName))
+				return
+			}
+		}
+
+		if len(pod.Spec.Volumes) > 0 {
+			// before binding pod to node, first bind volumes to pod
+			log.Log(log.ShimCacheTask).Debug("bind pod volumes",
+				zap.String("podName", pod.Name),
+				zap.String("podUID", string(pod.UID)))
+			if err := retry.OnError(retryBackoff, func(err error) bool {
+				if strings.HasPrefix(err.Error(), "binding volumes:") {
+					log.Log(log.ShimCacheTask).Warn("bind volumes to pod failed due to volume binding error, stopping retries",
+						zap.String("taskID", task.taskID), zap.Error(err))
+					return false
+				}
+				log.Log(log.ShimCacheTask).Error("bind volumes to pod failed, retrying",
+					zap.String("taskID", task.taskID), zap.Error(err))
+				return true
+			}, func() error {
+				return task.context.bindPodVolumes(pod)
+			}); err != nil {
+				if hasDRABindings {
+					task.context.unreserve(string(pod.UID), nodeName)
+				}
+				log.Log(log.ShimCacheTask).Error("bind volumes to pod failed after retries",
+					zap.String("taskID", task.taskID),
+					zap.Bool("hasDRABindings", hasDRABindings),
+					zap.Error(err))
+				// release task lock before calling rescheduleOnBindFailure to avoid deadlock
+				task.lock.Unlock()
+				task.rescheduleOnBindFailure(allocationKey, nodeName, "PodVolumesBindFailure",
+					fmt.Sprintf("Failed to bind volumes for %s on node %s, it will be retried", alias, nodeName))
+				return
+			}
 		}
 		log.Log(log.ShimCacheTask).Debug("bind pod",
 			zap.String("podName", pod.Name),
@@ -423,31 +448,27 @@ func (task *Task) postTaskAllocated() {
 		dispatcher.Dispatch(NewBindTaskEvent(task.applicationID, task.taskID))
 		task.lock.Unlock()
 		events.GetRecorder().Eventf(pod.DeepCopy(), nil,
-			v1.EventTypeNormal, "PodBindSuccessful", "PodBindSuccessful",
+			v1.EventTypeNormal, events.ReasonPodBindSuccessful, events.ReasonPodBindSuccessful,
 			"Pod %s is successfully bound to node %s", alias, nodeName)
 	}(pod, alias, nodeName, allocationKey)
 }
 
-// beforeTaskAllocated is called before handling the TaskAllocated event.
-// This sets the allocation information returned by the core in the task.
-// In some cases, the task is canceled (e.g. pod deleted) before we process the allocation
-// from the core. Those task will already be in the Completed state.
-// If we find the task is already in Completed state while handling TaskAllocated
-// event, we need to explicitly release this allocation because it is no
-// longer valid.
-func (task *Task) beforeTaskAllocated(eventSrc string, allocationKey string, nodeID string) {
-	// task is allocated on a node with a allocationKey set the details in the task here to allow referencing later.
+// beforeTaskAllocated records the allocation before entering Allocated, where
+// postTaskAllocated starts binding the pod.
+func (task *Task) beforeTaskAllocated(allocationKey string, nodeID string) {
 	task.allocationKey = allocationKey
 	task.nodeName = nodeID
-	// If the task is Completed the pod was deleted on K8s but the core was not aware yet.
-	// Notify the core to release this allocation to avoid resource leak.
-	// The ask is not relevant at this point.
+}
+
+// afterTaskAllocated releases late allocations for deleted pods. This must be an
+// after-event callback: Completed -> Completed does not enter a new state.
+func (task *Task) afterTaskAllocated(eventSrc string) {
 	if eventSrc == TaskStates().Completed {
 		log.Log(log.ShimCacheTask).Info("task is already completed, invalidate the allocation",
 			zap.String("currentTaskState", eventSrc),
-			zap.String("allocationKey", allocationKey),
-			zap.String("allocatedNode", nodeID))
-		task.releaseAllocation(false)
+			zap.String("allocationKey", task.allocationKey),
+			zap.String("allocatedNode", task.nodeName))
+		task.releaseAllocation(eventSrc, false)
 	}
 }
 
@@ -472,32 +493,30 @@ func (task *Task) postTaskRejected() {
 		fmt.Sprintf("task %s failed because it is rejected by scheduler", task.alias)))
 }
 
-// beforeTaskFail releases the allocation or ask from scheduler core
-// this is done as a before hook because the releaseAllocation() call needs to
-// send different requests to scheduler-core, depending on current task state
-func (task *Task) beforeTaskFail() {
+// afterTaskFail releases the allocation after the FSM has dropped its locks.
+func (task *Task) afterTaskFail(eventSrc string) {
 	events.GetRecorder().Eventf(task.pod.DeepCopy(), nil,
-		v1.EventTypeNormal, "TaskFailed", "TaskFailed",
+		v1.EventTypeWarning, "TaskFailed", "TaskFailed",
 		"Task %s is failed", task.alias)
-	task.releaseAllocation(false)
+	task.releaseAllocation(eventSrc, false)
 }
 
-// beforeTaskCompleted releases the allocation or ask from scheduler core
-// this is done as a before hook because the releaseAllocation() call needs to
-// send different requests to scheduler-core, depending on current task state
-func (task *Task) beforeTaskCompleted() {
-	task.releaseAllocation(false)
+// afterTaskCompleted releases the allocation after the FSM has dropped its locks.
+func (task *Task) afterTaskCompleted(eventSrc string) {
+	task.releaseAllocation(eventSrc, false)
 
 	events.GetRecorder().Eventf(task.pod.DeepCopy(), nil,
-		v1.EventTypeNormal, "TaskCompleted", "TaskCompleted",
+		v1.EventTypeNormal, events.ReasonTaskCompleted, events.ReasonTaskCompleted,
 		"Task %s is completed", task.alias)
 }
 
 // releaseAllocation sends the release request for the Allocation to the core.
-func (task *Task) releaseAllocation(force bool) {
+// The caller must hold task.lock, without holding the FSM locks. eventSrc is the
+// pre-transition state for task events, or the current state for deferred releases.
+func (task *Task) releaseAllocation(eventSrc string, force bool) {
 	terminationType := common.GetTerminationTypeFromString(task.terminationType)
 
-	if !force && task.shouldAppRelease() {
+	if !force && task.application.tryAddReleasableTask(task) {
 		log.Log(log.ShimCacheTask).Info("not releasing task right now, app has not been accepted",
 			zap.String("appState", task.application.sm.Current()))
 		return
@@ -510,7 +529,7 @@ func (task *Task) releaseAllocation(force bool) {
 			zap.String("taskID", task.taskID),
 			zap.String("taskAlias", task.alias),
 			zap.String("allocationKey", task.allocationKey),
-			zap.String("task", task.GetTaskState()),
+			zap.String("task", eventSrc),
 			zap.String("terminationType", string(terminationType)))
 
 		// send an AllocationReleaseRequest
@@ -518,15 +537,15 @@ func (task *Task) releaseAllocation(force bool) {
 		s := TaskStates()
 
 		// check if the task is in a state where it has not been allocated yet
-		if task.GetTaskState() != s.New && task.GetTaskState() != s.Pending &&
-			task.GetTaskState() != s.Scheduling && task.GetTaskState() != s.Rejected {
+		if eventSrc != s.New && eventSrc != s.Pending &&
+			eventSrc != s.Scheduling && eventSrc != s.Rejected {
 			// task is in a state where it might have been allocated
 			if task.allocationKey == "" {
 				log.Log(log.ShimCacheTask).Warn("BUG: task allocationKey is empty on release",
 					zap.String("applicationID", task.applicationID),
 					zap.String("taskID", task.taskID),
 					zap.String("taskAlias", task.alias),
-					zap.String("taskState", task.GetTaskState()))
+					zap.String("taskState", eventSrc))
 			}
 		}
 
@@ -548,10 +567,12 @@ func (task *Task) releaseAllocation(force bool) {
 	}
 }
 
-func (task *Task) shouldAppRelease() bool {
-	task.lock.Unlock()
-	defer task.lock.Lock()
-	return task.application.tryAddReleasableTask(task)
+// forceReleaseAllocation releases the allocation for callers that do not already hold the task
+// lock. The application lock is taken before the task lock on every path that holds both.
+func (task *Task) forceReleaseAllocation() {
+	task.lock.Lock()
+	defer task.lock.Unlock()
+	task.releaseAllocation(task.GetTaskState(), true)
 }
 
 // some sanity checks before sending task for scheduling,
@@ -578,7 +599,7 @@ func (task *Task) checkPodMetadataBeforeScheduling() {
 	}
 }
 
-func (task *Task) logIgnoredPodMetadata(pod *v1.Pod, metadataType string, fianlValue string, ignoredLabel map[string]string, ignoredAnnotation map[string]string) {
+func (task *Task) logIgnoredPodMetadata(pod *v1.Pod, metadataType string, finalValue string, ignoredLabel map[string]string, ignoredAnnotation map[string]string) {
 	ignoredItems := make([]string, 0)
 	for key, value := range ignoredLabel {
 		ignoredItems = append(ignoredItems, fmt.Sprintf("(Label) %s: %s", key, value))
@@ -586,8 +607,8 @@ func (task *Task) logIgnoredPodMetadata(pod *v1.Pod, metadataType string, fianlV
 	for key, value := range ignoredAnnotation {
 		ignoredItems = append(ignoredItems, fmt.Sprintf("(Annotation) %s: %s", key, value))
 	}
-	logMessage := fmt.Sprintf("Found multiple '%s' value in pod. { podName: %s, fianlValue: %s, ignored: [%s] }",
-		metadataType, pod.Name, fianlValue, strings.Join(ignoredItems, ", "))
+	logMessage := fmt.Sprintf("Found multiple '%s' value in pod. { podName: %s, finalValue: %s, ignored: [%s] }",
+		metadataType, pod.Name, finalValue, strings.Join(ignoredItems, ", "))
 
 	log.Log(log.ShimCacheTask).Warn(logMessage)
 	events.GetRecorder().Eventf(pod.DeepCopy(),
@@ -691,12 +712,14 @@ func (task *Task) rollbackAllocation(podCopy *v1.Pod, appID, partition, allocati
 	events.GetRecorder().Eventf(podCopy, nil,
 		v1.EventTypeWarning, eventReason, eventReason, eventMsg)
 
-	// Revert any PV/PVC assumptions made by the volume binder. Idempotent: safe to call
-	// even if AssumePodVolumes was never reached or already cleaned up internally.
-	task.context.RevertPodVolumeAssumptions(allocationKey, nodeID)
+	if len(podCopy.Spec.Volumes) > 0 {
+		// Revert any PV/PVC assumptions made by the volume binder. Idempotent: safe to call
+		// even if AssumePodVolumes was never reached or already cleaned up internally.
+		task.context.RevertPodVolumeAssumptions(allocationKey, nodeID)
 
-	// ForgetPod is idempotent: removes the pod from the assumed-pods cache.
-	task.context.ForgetPod(allocationKey)
+		// ForgetPod is idempotent: removes the pod from the assumed-pods cache.
+		task.context.ForgetPod(allocationKey)
+	}
 
 	// Notify the core to roll back the allocation to a pending ask.
 	if schedulerAPI := task.context.apiProvider.GetAPIs().SchedulerAPI; schedulerAPI != nil {

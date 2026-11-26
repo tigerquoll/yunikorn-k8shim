@@ -19,7 +19,9 @@
 package cache
 
 import (
+	ctx "context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -29,7 +31,6 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apis "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sEvents "k8s.io/client-go/tools/events"
-	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 
 	"github.com/apache/yunikorn-k8shim/pkg/client"
@@ -69,6 +70,14 @@ func TestUpdateAllocation_NewTask_TaskNotFound(t *testing.T) {
 	callback, context := initCallbackTest(t, false, false)
 	defer dispatcher.UnregisterAllEventHandlers()
 	defer dispatcher.Stop()
+	var taskCompleted atomic.Bool
+	dispatcher.RegisterEventHandler("testTaskCompleteHandler", dispatcher.EventTypeTask, func(obj interface{}) {
+		if event, ok := obj.(events.TaskEvent); ok &&
+			event.GetApplicationID() == appID && event.GetTaskID() == taskUID1 &&
+			event.GetEvent() == CompleteTask.String() {
+			taskCompleted.Store(true)
+		}
+	})
 	pod := context.getTask(appID, taskUID1).pod
 	context.RemoveTask(appID, taskUID1)
 	context.DeletePod(pod)
@@ -83,6 +92,10 @@ func TestUpdateAllocation_NewTask_TaskNotFound(t *testing.T) {
 		},
 	})
 	assert.NilError(t, err, "error updating allocation")
+	// DeletePod queues CompleteTask even though the task has already been removed.
+	// Consume it before stopping the dispatcher so it cannot reach the next test.
+	err = utils.WaitForCondition(taskCompleted.Load, 10*time.Millisecond, time.Second)
+	assert.NilError(t, err, "CompleteTask was not handled before stopping the dispatcher")
 }
 
 func TestUpdateAllocation_NewTask_AssumePodFails(t *testing.T) {
@@ -154,8 +167,11 @@ func TestUpdateAllocation_PlaceholderTask_AssumePodFails(t *testing.T) {
 		return task.GetTaskState() == TaskStates().Failed
 	}, 10*time.Millisecond, time.Second)
 	assert.NilError(t, err, "placeholder task has not transitioned to Failed state")
-	// FailWithEvent emits a Warning/"AssumePodError" event; beforeTaskFail emits a Normal/"TaskFailed" event.
-	assert.Equal(t, 2, len(recorder.Events), "expected two K8s events to be recorded")
+	// FailWithEvent emits a Warning/"AssumePodError" event; afterTaskFail emits a Normal/"TaskFailed" event.
+	err = utils.WaitForCondition(func() bool {
+		return len(recorder.Events) == 2
+	}, 10*time.Millisecond, time.Second)
+	assert.NilError(t, err, "expected two K8s events to be recorded, got %d", len(recorder.Events))
 	assumePodErrorFound := false
 	for i := 0; i < 2; i++ {
 		event := <-recorder.Events
@@ -164,6 +180,61 @@ func TestUpdateAllocation_PlaceholderTask_AssumePodFails(t *testing.T) {
 		}
 	}
 	assert.Assert(t, assumePodErrorFound, "no event with reason 'AssumePodError' was recorded")
+}
+
+// TestUpdateAllocation_ContextCanceled_ProcessesRemainingBatch verifies that a
+// canceled stopCtx aborts AssumePod retries without dropping the rest of the
+// response.New batch or rolling back the already-canceled allocation.
+func TestUpdateAllocation_ContextCanceled_ProcessesRemainingBatch(t *testing.T) {
+	_, context := initCallbackTest(t, false, false)
+	defer dispatcher.UnregisterAllEventHandlers()
+	defer dispatcher.Stop()
+
+	// register a second task under the same app so a single UpdateAllocation
+	// batch can carry two `New` allocations; mirrors initCallbackTest's own
+	// pod-construction pattern for taskUID1 (Annotations-based app ID, no
+	// Spec.NodeName so it is unassigned and must go through AssumePod).
+	pod2 := &v1.Pod{
+		TypeMeta: apis.TypeMeta{
+			Kind:       "Pod",
+			APIVersion: "v1",
+		},
+		ObjectMeta: apis.ObjectMeta{
+			Name: "yunikorn-test-00002",
+			UID:  taskUID2,
+			Annotations: map[string]string{
+				constants.AnnotationApplicationID: appID,
+			},
+		},
+		Spec: v1.PodSpec{SchedulerName: "yunikorn"},
+	}
+	context.AddPod(pod2)
+	task2 := context.getTask(appID, taskUID2)
+	assert.Assert(t, task2 != nil)
+	task2.sm.SetState(TaskStates().Scheduling)
+
+	// swap in a callback whose stopCtx is already canceled, simulating
+	// KubernetesShim.Stop() having already run before this batch arrives.
+	cancelCtx, cancel := ctx.WithCancel(ctx.Background())
+	cancel()
+	callback := NewAsyncRMCallback(context, cancelCtx)
+
+	task1 := context.getTask(appID, taskUID1)
+	err := callback.UpdateAllocation(&si.AllocationResponse{
+		New: []*si.Allocation{
+			{ApplicationID: appID, AllocationKey: taskUID1, NodeID: fakeNodeName},
+			{ApplicationID: appID, AllocationKey: taskUID2, NodeID: fakeNodeName},
+		},
+	})
+	assert.NilError(t, err, "a canceled-context batch must not surface an error to the RM proxy")
+	assert.Assert(t, !context.schedulerCache.IsAssumedPod(taskUID1))
+	assert.Assert(t, !context.schedulerCache.IsAssumedPod(taskUID2))
+	// setAllocationKey runs unconditionally as the first step of each loop
+	// iteration, before the retry/cancellation logic; task2 only has it set
+	// if the loop actually reached the second allocation.
+	assert.Equal(t, taskUID2, task2.GetAllocationKey(), "second allocation in the batch must still be reached after the first hits a canceled context")
+	assert.Equal(t, TaskStates().Scheduling, task1.GetTaskState(), "canceled allocation must not be rolled back")
+	assert.Equal(t, TaskStates().Scheduling, task2.GetTaskState(), "canceled allocation must not be rolled back")
 }
 
 func TestUpdateAllocation_NewTask_PodAlreadyAssigned(t *testing.T) {
@@ -318,12 +389,33 @@ func TestUpdateApplication_Rejected(t *testing.T) {
 		return app.sm.Current() == ApplicationStates().Failed
 	}, 10*time.Millisecond, time.Second)
 	assert.NilError(t, err, "application has not transitioned to Failed state")
-	assert.Equal(t, 1, len(recorder.Events), "no K8s event received")
+	err = utils.WaitForCondition(func() bool {
+		return len(recorder.Events) == 1
+	}, 10*time.Millisecond, time.Second)
+	assert.NilError(t, err, "expected one K8s event to be recorded, got %d", len(recorder.Events))
 	event := <-recorder.Events
 	assert.Assert(t, strings.Contains(event, "test failure"), "event does not contain 'test failure': %s", event)
 }
 
 func TestUpdateApplication_Completed(t *testing.T) {
+	callback, context := initCallbackTest(t, false, false)
+	defer dispatcher.UnregisterAllEventHandlers()
+	defer dispatcher.Stop()
+	context.getTask(appID, taskUID1).sm.SetState(TaskStates().Completed)
+
+	err := callback.UpdateApplication(&si.ApplicationResponse{
+		Updated: []*si.UpdatedApplication{
+			{
+				ApplicationID: appID,
+				State:         ApplicationStates().Completed,
+			},
+		},
+	})
+	assert.NilError(t, err, "error updating application")
+	assert.Assert(t, context.getApplication(appID) == nil, "application was not removed")
+}
+
+func TestUpdateApplication_Completed_ActiveTasks(t *testing.T) {
 	callback, context := initCallbackTest(t, false, false)
 	defer dispatcher.UnregisterAllEventHandlers()
 	defer dispatcher.Stop()
@@ -337,7 +429,7 @@ func TestUpdateApplication_Completed(t *testing.T) {
 		},
 	})
 	assert.NilError(t, err, "error updating application")
-	assert.Assert(t, context.getApplication(appID) == nil, "application was not removed")
+	assert.Assert(t, context.getApplication(appID) != nil, "application with active tasks should not be removed")
 }
 
 func TestUpdateApplication_Resuming_AppReserving(t *testing.T) {
@@ -433,7 +525,10 @@ func testUpdateApplicationFailure(t *testing.T, state string) {
 		return app.sm.Current() == ApplicationStates().Failing
 	}, 10*time.Millisecond, time.Second)
 	assert.NilError(t, err, "application has not transitioned to %s state", state)
-	assert.Equal(t, 1, len(recorder.Events), "no K8s event received")
+	err = utils.WaitForCondition(func() bool {
+		return len(recorder.Events) == 1
+	}, 10*time.Millisecond, time.Second)
+	assert.NilError(t, err, "expected one K8s event to be recorded, got %d", len(recorder.Events))
 	event := <-recorder.Events
 	assert.Assert(t, strings.Contains(event, "test failure"), "event does not contain 'test failure': %s", event)
 }
@@ -481,35 +576,138 @@ func testUpdateNode(t *testing.T, expectedEvent string, response *si.NodeRespons
 	assert.NilError(t, err)
 }
 
+func TestPredicatesPreFilter(t *testing.T) {
+	callback, context := initCallbackTest(t, false, false)
+	defer dispatcher.UnregisterAllEventHandlers()
+	defer dispatcher.Stop()
+	context.predManager = NewMockPredicateManager(false, false, false, false, false)
+
+	// pod not found
+	predicatesResults := callback.PreFilterPredicates(&si.PreFilterPredicatesArgs{AllocationKey: "unknown", Allocate: true})
+	assert.Equal(t, predicatesResults.GetSuccess(), false)
+	assert.Equal(t, len(predicatesResults.GetFeasibleNodes()), 0)
+	assert.Equal(t, predicatesResults.GetErrorMessage(), "predicates were not run because pod was not found in cache")
+	assert.Assert(t, callback.context.schedulerCache.GetCycleState(&v1.Pod{ObjectMeta: apis.ObjectMeta{
+		Name: "unknown",
+		UID:  "unknown",
+	},
+	}) == nil)
+
+	// pod found
+	predicatesResults = callback.PreFilterPredicates(&si.PreFilterPredicatesArgs{AllocationKey: taskUID1, Allocate: true})
+	assert.Equal(t, predicatesResults.GetSuccess(), true)
+	assert.Equal(t, len(predicatesResults.GetFeasibleNodes()), 0)
+	assert.Equal(t, predicatesResults.GetErrorMessage(), "")
+	assert.Assert(t, callback.context.schedulerCache.GetCycleState(&v1.Pod{ObjectMeta: apis.ObjectMeta{
+		Name: taskUID1,
+		UID:  taskUID1,
+	},
+	}) != nil)
+
+	context.predManager = NewMockPredicateManager(true, false, false, false, false)
+	predicatesResults = callback.PreFilterPredicates(&si.PreFilterPredicatesArgs{AllocationKey: taskUID1, Allocate: true})
+	assert.Equal(t, predicatesResults.GetSuccess(), false)
+	assert.Equal(t, len(predicatesResults.GetFeasibleNodes()), 0)
+	assert.Equal(t, predicatesResults.GetErrorMessage(), "fail prefilter")
+}
+
 func TestPredicates(t *testing.T) {
 	callback, context := initCallbackTest(t, false, false)
 	defer dispatcher.UnregisterAllEventHandlers()
 	defer dispatcher.Stop()
-	context.predManager = &mockPredicateManager{}
+	context.predManager = NewMockPredicateManager(false, false, false, false, false)
 
 	// pod not found
 	err := callback.Predicates(&si.PredicatesArgs{AllocationKey: "unknown", NodeID: fakeNodeName, Allocate: true})
 	assert.Error(t, err, "predicates were not run because pod was not found in cache")
+	assert.Assert(t, callback.context.schedulerCache.GetCycleState(&v1.Pod{ObjectMeta: apis.ObjectMeta{
+		Name: "unknown",
+		UID:  "unknown",
+	},
+	}) == nil)
 
-	// pod found
+	// pod found, node not found
+	err = callback.Predicates(&si.PredicatesArgs{AllocationKey: taskUID1, NodeID: "unknown", Allocate: true})
+	assert.Error(t, err, "predicates were not run because node was not found in cache")
+
+	// both pod and node found, cycle state not found
+	err = callback.Predicates(&si.PredicatesArgs{AllocationKey: taskUID1, NodeID: fakeNodeName, Allocate: true})
+	assert.Error(t, err, "predicates were not run because pod's cycle state was not found in cache")
+
+	// pod, node & cycle state found
+	results := callback.PreFilterPredicates(&si.PreFilterPredicatesArgs{AllocationKey: taskUID1, Allocate: true})
+	assert.Equal(t, results.GetSuccess(), true)
+	assert.Equal(t, len(results.GetFeasibleNodes()), 0)
+	assert.Equal(t, results.GetErrorMessage(), "")
+	assert.Assert(t, callback.context.schedulerCache.GetCycleState(&v1.Pod{ObjectMeta: apis.ObjectMeta{
+		Name: taskUID1,
+		UID:  taskUID1,
+	},
+	}) != nil)
 	err = callback.Predicates(&si.PredicatesArgs{AllocationKey: taskUID1, NodeID: fakeNodeName, Allocate: true})
 	assert.NilError(t, err)
+	assert.Assert(t, callback.context.schedulerCache.GetCycleState(&v1.Pod{ObjectMeta: apis.ObjectMeta{
+		Name: taskUID1,
+		UID:  taskUID1,
+	},
+	}) != nil)
+
+	context.predManager = NewMockPredicateManager(false, true, false, false, false)
+	err = callback.Predicates(&si.PredicatesArgs{AllocationKey: taskUID1, NodeID: fakeNodeName, Allocate: true})
+	assert.ErrorContains(t, err, "fail filter")
 }
 
 func TestPreemptionPredicates(t *testing.T) {
 	callback, context := initCallbackTest(t, false, false)
 	defer dispatcher.UnregisterAllEventHandlers()
 	defer dispatcher.Stop()
-	context.predManager = &mockPredicateManager{}
+	context.predManager = NewMockPredicateManager(false, false, false, false, false)
 
 	// pod not found
 	resp := callback.PreemptionPredicates(&si.PreemptionPredicatesArgs{AllocationKey: "unknown", NodeID: fakeNodeName, StartIndex: 0})
-	assert.Assert(t, !resp.Success, "response should have failed")
+	assert.Assert(t, !resp.GetSuccess(), "response should have failed")
+	assert.Assert(t, resp.GetErrorMessage()[ErrorPodNotFound.Error()] == 1, "incorrect plugin error")
+	assert.Assert(t, callback.context.schedulerCache.GetCycleState(&v1.Pod{ObjectMeta: apis.ObjectMeta{
+		Name: "unknown",
+		UID:  "unknown",
+	},
+	}) == nil)
 
-	// pod found
+	// pod found, node not found
+	resp = callback.PreemptionPredicates(&si.PreemptionPredicatesArgs{AllocationKey: taskUID1, NodeID: "unknown", StartIndex: 0})
+	assert.Assert(t, !resp.GetSuccess(), "response should have failed")
+	assert.Assert(t, resp.GetErrorMessage()[ErrorNodeNotFound.Error()] == 1, "incorrect plugin error")
+
+	// both pod and node found, cycle state not found
+	resp = callback.PreemptionPredicates(&si.PreemptionPredicatesArgs{AllocationKey: taskUID1, NodeID: fakeNodeName, StartIndex: 0})
+	assert.Assert(t, !resp.GetSuccess(), "response should have failed")
+	assert.Assert(t, resp.GetErrorMessage()[ErrorCycleStateNotFound.Error()] == 1, "incorrect plugin error")
+
+	// pod, node & cycle state found
+	results := callback.PreFilterPredicates(&si.PreFilterPredicatesArgs{AllocationKey: taskUID1, Allocate: true})
+	assert.Equal(t, results.GetSuccess(), true)
+	assert.Equal(t, len(results.GetFeasibleNodes()), 0)
+	assert.Equal(t, results.GetErrorMessage(), "")
+	assert.Assert(t, callback.context.schedulerCache.GetCycleState(&v1.Pod{ObjectMeta: apis.ObjectMeta{
+		Name: taskUID1,
+		UID:  taskUID1,
+	},
+	}) != nil)
 	resp = callback.PreemptionPredicates(&si.PreemptionPredicatesArgs{AllocationKey: taskUID1, NodeID: fakeNodeName, StartIndex: 0, PreemptAllocationKeys: []string{taskUID1}})
 	assert.Assert(t, resp.Success, "response should have succeeded")
 	assert.Equal(t, int32(0), resp.Index)
+	assert.Assert(t, callback.context.schedulerCache.GetCycleState(&v1.Pod{ObjectMeta: apis.ObjectMeta{
+		Name: taskUID1,
+		UID:  taskUID1,
+	},
+	}) != nil)
+
+	context.predManager = NewMockPredicateManager(false, false, true, false, false)
+	resp = callback.PreemptionPredicates(&si.PreemptionPredicatesArgs{AllocationKey: taskUID1, NodeID: fakeNodeName, StartIndex: 0, PreemptAllocationKeys: []string{taskUID1}})
+	assert.Assert(t, !resp.Success, "response should have succeeded")
+	assert.Equal(t, int32(-1), resp.Index)
+	assert.Equal(t, 1, len(resp.ErrorMessage))
+	assert.Equal(t, int32(1), resp.ErrorMessage["fail_preemption_filter"])
 }
 
 func TestSendEvent(t *testing.T) {
@@ -558,6 +756,41 @@ func TestUpdateContainerSchedulingState(t *testing.T) {
 	assert.Equal(t, TaskSchedFailed, task.GetTaskSchedulingState())
 }
 
+func TestUpdateContainerSchedulingStatePassesStopCtx(t *testing.T) {
+	for _, state := range []si.UpdateContainerSchedulingStateRequest_SchedulingState{
+		si.UpdateContainerSchedulingStateRequest_SKIPPED,
+		si.UpdateContainerSchedulingStateRequest_FAILED,
+	} {
+		t.Run(state.String(), func(t *testing.T) {
+			_, context := initCallbackTest(t, false, false)
+			defer dispatcher.UnregisterAllEventHandlers()
+			defer dispatcher.Stop()
+
+			cancelCtx, cancel := ctx.WithCancel(ctx.Background())
+			cancel()
+			callback := NewAsyncRMCallback(context, cancelCtx)
+
+			var updateCtx ctx.Context
+			apiProvider, ok := context.apiProvider.(*client.MockedAPIProvider)
+			assert.Assert(t, ok)
+			apiProvider.MockUpdateStatusFn(func(c ctx.Context, pod *v1.Pod) (*v1.Pod, error) {
+				updateCtx = c
+				return pod, c.Err()
+			})
+			context.getTask(appID, taskUID1).sm.SetState(TaskStates().Scheduling)
+
+			callback.UpdateContainerSchedulingState(&si.UpdateContainerSchedulingStateRequest{
+				State:         state,
+				ApplicationID: appID,
+				AllocationKey: taskUID1,
+			})
+
+			assert.Assert(t, updateCtx != nil, "pod status update was not attempted")
+			assert.ErrorIs(t, updateCtx.Err(), ctx.Canceled)
+		})
+	}
+}
+
 func TestCallbackGetStateDump(t *testing.T) {
 	callback, _ := initCallbackTest(t, false, false)
 	defer dispatcher.UnregisterAllEventHandlers()
@@ -573,18 +806,61 @@ func TestCallbackGetStateDump(t *testing.T) {
 
 var _ predicates.PredicateManager = &mockPredicateManager{}
 
-type mockPredicateManager struct{}
+type mockPredicateManager struct {
+	failPreFilter        bool
+	failFilter           bool
+	failPreemptionFilter bool
+	failReserve          bool
+	failPreBind          bool
+}
 
-func (m *mockPredicateManager) EventsToRegister(_ fwk.QueueingHintFn) []fwk.ClusterEventWithHint {
+func NewMockPredicateManager(failPreFilter, failFilter, failPreemptionFilter, failReserve bool, failPreBind bool) *mockPredicateManager {
+	return &mockPredicateManager{
+		failPreFilter:        failPreFilter,
+		failFilter:           failFilter,
+		failPreemptionFilter: failPreemptionFilter,
+		failReserve:          failReserve,
+		failPreBind:          failPreBind,
+	}
+}
+
+func (m *mockPredicateManager) PreFilter(_ *v1.Pod, _ bool) (map[string]*si.Empty, *framework.CycleState, error) {
+	if m.failPreFilter {
+		return make(map[string]*si.Empty), nil, errors.New("fail prefilter")
+	}
+	return map[string]*si.Empty{}, framework.NewCycleState(), nil
+}
+
+func (m *mockPredicateManager) Filter(_ *v1.Pod, _ *framework.NodeInfo, _ *framework.CycleState, _ bool) error {
+	if m.failFilter {
+		return errors.New("fail filter")
+	}
+	return nil
+}
+func (m *mockPredicateManager) Reserve(pod *v1.Pod, cycleState *framework.CycleState, node *framework.NodeInfo) error {
+	if m.failReserve {
+		return errors.New("fail reserve")
+	}
 	return nil
 }
 
-func (m *mockPredicateManager) Predicates(_ *v1.Pod, _ *framework.NodeInfo, _ bool) (string, error) {
-	return "", nil
+func (m *mockPredicateManager) PreBind(pod *v1.Pod, cycleState *framework.CycleState, node *framework.NodeInfo) error {
+	if m.failPreBind {
+		return errors.New("fail preBind")
+	}
+	return nil
 }
 
-func (m *mockPredicateManager) PreemptionPredicates(_ *v1.Pod, _ *framework.NodeInfo, _ []*v1.Pod, _ int) int {
-	return 0
+func (m *mockPredicateManager) Unreserve(pod *v1.Pod, cycleState *framework.CycleState, node *framework.NodeInfo) {
+}
+
+func (m *mockPredicateManager) PreemptionFilter(_ *v1.Pod, _ *framework.NodeInfo, _ *framework.CycleState, _ []*v1.Pod, _ int) (int, map[string]int32) {
+	if m.failPreemptionFilter {
+		err := map[string]int32{}
+		err["fail_preemption_filter"]++
+		return -1, err
+	}
+	return 0, nil
 }
 
 func initCallbackTest(t *testing.T, podAssigned, placeholder bool) (*AsyncRMCallback, *Context) {
@@ -592,7 +868,7 @@ func initCallbackTest(t *testing.T, podAssigned, placeholder bool) (*AsyncRMCall
 	dispatcher.Start()
 	dispatcher.RegisterEventHandler("TestAppHandler", dispatcher.EventTypeApp, context.ApplicationEventHandler())
 	dispatcher.RegisterEventHandler("TestTaskHandler", dispatcher.EventTypeTask, context.TaskEventHandler())
-	callback := NewAsyncRMCallback(context)
+	callback := NewAsyncRMCallback(context, t.Context())
 	apiProvider.MockSchedulerAPIUpdateNodeFn(func(request *si.NodeRequest) error {
 		for _, node := range request.Nodes {
 			dispatcher.Dispatch(CachedSchedulerNodeEvent{
@@ -629,6 +905,8 @@ func initCallbackTest(t *testing.T, podAssigned, placeholder bool) (*AsyncRMCall
 	}
 	if placeholder {
 		pod.Annotations[constants.AnnotationPlaceholderFlag] = constants.True
+		pod.Annotations[constants.AnnotationTaskGroupName] = "test-group-1"
+		pod.OwnerReferences = getOwnerReference(&v1.Pod{ObjectMeta: apis.ObjectMeta{Name: "originator", UID: "originator-uid"}})
 	}
 	context.AddPod(pod)
 	task := context.getTask(appID, taskUID1)

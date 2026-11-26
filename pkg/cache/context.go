@@ -39,8 +39,9 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/dynamic-resource-allocation/resourceslice/tracker"
 	"k8s.io/klog/v2"
-	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/dynamicresources"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/volumebinding"
 	"k8s.io/kubernetes/pkg/scheduler/util/assumecache"
@@ -64,21 +65,23 @@ import (
 const registerNodeContextHandler = "RegisterNodeContextHandler"
 
 var (
-	ErrorPodNotFound  = errors.New("predicates were not run because pod was not found in cache")
-	ErrorNodeNotFound = errors.New("predicates were not run because node was not found in cache")
+	ErrorPodNotFound        = errors.New("predicates were not run because pod was not found in cache")
+	ErrorNodeNotFound       = errors.New("predicates were not run because node was not found in cache")
+	ErrorCycleStateNotFound = errors.New("predicates were not run because pod's cycle state was not found in cache")
 )
 
 // context maintains scheduling state, like apps and apps' tasks.
 type Context struct {
-	applications   map[string]*Application        // apps
-	schedulerCache *schedulercache.SchedulerCache // external cache
-	apiProvider    client.APIProvider             // apis to interact with api-server, scheduler-core, etc
-	predManager    predicates.PredicateManager    // K8s predicates
-	namespace      string                         // yunikorn namespace
-	configMaps     []*v1.ConfigMap                // cached yunikorn configmaps
-	lock           *locking.RWMutex               // lock - used not only for context data but also to ensure that multiple event types are not executed concurrently
-	txnID          atomic.Uint64                  // transaction ID counter
-	klogger        klog.Logger
+	applications         map[string]*Application        // apps
+	schedulerCache       *schedulercache.SchedulerCache // external cache
+	apiProvider          client.APIProvider             // apis to interact with api-server, scheduler-core, etc
+	predManager          predicates.PredicateManager    // K8s predicates
+	namespace            string                         // yunikorn namespace
+	configMaps           []*v1.ConfigMap                // cached yunikorn configmaps
+	lock                 *locking.RWMutex               // lock - used not only for context data but also to ensure that multiple event types are not executed concurrently
+	txnID                atomic.Uint64                  // transaction ID counter
+	klogger              klog.Logger
+	resourceSliceTracker *tracker.Tracker
 }
 
 // NewContext create a new context for the scheduler using a default (empty) configuration
@@ -119,16 +122,33 @@ func NewContextWithBootstrapConfigMaps(apis client.APIProvider, bootstrapConfigM
 		resourceSliceTracker, err := tracker.StartTracker(context.TODO(), tracker.Options{
 			EnableDeviceTaintRules: feature.DefaultFeatureGate.Enabled(features.DRADeviceTaints),
 			SliceInformer:          informerFactory.Resource().V1().ResourceSlices(),
-			ClassInformer:          informerFactory.Resource().V1().DeviceClasses(),
-			TaintInformer:          informerFactory.Resource().V1beta2().DeviceTaintRules()})
+			TaintInformer:          informerFactory.Resource().V1().DeviceTaintRules()})
 		if err != nil {
 			log.Log(log.ShimClient).Error("unable to create the resource slice tracker", zap.Error(err))
 			return nil
 		}
+		ctx.resourceSliceTracker = resourceSliceTracker
 		sharedDRAManager = dynamicresources.NewDRAManager(context.TODO(), resourceClaimCache, resourceSliceTracker, informerFactory)
 	}
-	ctx.predManager = predicates.NewPredicateManager(support.NewFrameworkHandle(sharedLister, informerFactory, clientSet, csiManager, sharedDRAManager))
+
+	config, err := predicates.DefaultConfig()
+	if err != nil {
+		log.Log(log.ShimClient).Error("unable to create the predicates config", zap.Error(err))
+	}
+	ctx.predManager = predicates.NewPredicateManager(support.NewFrameworkHandle(sharedLister, informerFactory, clientSet, csiManager, sharedDRAManager), plugins.NewInTreeRegistry(), config)
 	return ctx
+}
+
+// Stop ends all background activity managed by Context.
+func (ctx *Context) Stop() {
+	ctx.lock.Lock()
+	t := ctx.resourceSliceTracker
+	ctx.resourceSliceTracker = nil
+	ctx.lock.Unlock()
+
+	if t != nil {
+		t.Stop()
+	}
 }
 
 func (ctx *Context) AddSchedulingEventHandlers() error {
@@ -237,8 +257,6 @@ func (ctx *Context) updateNodeInternal(node *v1.Node, register bool) {
 			// update capacity
 			if err := ctx.updateNodeResources(node, newCapacity); err != nil {
 				log.Log(log.ShimContext).Warn("Failed to update node capacity", zap.Error(err))
-			} else {
-				log.Log(log.ShimContext).Warn("Failed to update cached node capacity", zap.String("nodeName", node.Name))
 			}
 		}
 		if err := ctx.updateNodeSchedulability(prevNode, node); err != nil {
@@ -374,7 +392,7 @@ func (ctx *Context) updateYuniKornPod(appID string, oldPod, pod *v1.Pod) {
 		for _, gate := range pod.Spec.SchedulingGates {
 			gates = append(gates, gate.Name)
 		}
-		events.GetRecorder().Eventf(pod.DeepCopy(), nil, v1.EventTypeNormal, "Scheduling", "Scheduling",
+		events.GetRecorder().Eventf(pod.DeepCopy(), nil, v1.EventTypeNormal, events.ReasonScheduling, events.ReasonScheduling,
 			"waiting for scheduling gates: %s", strings.Join(gates, ","))
 		log.Log(log.ShimContext).Info("pod is waiting for scheduling gates", zap.String("name", pod.Name), zap.Strings("gates", gates))
 	}
@@ -438,7 +456,7 @@ func (ctx *Context) updateForeignPod(oldPod, pod *v1.Pod) {
 				zap.String("podStatusBefore", podStatusBefore),
 				zap.String("podStatusCurrent", string(pod.Status.Phase)))
 			if oldPod == nil || !common.Equals(common.GetPodResource(oldPod), common.GetPodResource(pod)) {
-				allocReq := common.CreateAllocationForForeignPod(pod)
+				allocReq := common.CreateAllocationForForeignPod(pod, ctx.IsPodPreemptSelfAllowed(pod))
 				if err := ctx.apiProvider.GetAPIs().SchedulerAPI.UpdateAllocation(allocReq); err != nil {
 					log.Log(log.ShimContext).Error("failed to add foreign allocation to the core",
 						zap.Error(err))
@@ -454,20 +472,18 @@ func (ctx *Context) updateForeignPod(oldPod, pod *v1.Pod) {
 		return
 	}
 
-	// conditions for release:
-	//   1. pod was previously assigned
-	//   2. pod is now in a terminated state
-	//   3. pod references a known node
+	// When an assigned foreign pod terminates:
+	//   1. Always remove it from schedulerCache to prevent phantom adoption if the node registers later.
+	//   2. Only trigger allocation release in the core if the pod was assigned to a known node (not orphaned).
 	if oldPod != nil && utils.IsPodTerminated(pod) {
-		if !ctx.schedulerCache.IsPodOrphaned(string(pod.UID)) {
+		isOrphaned := ctx.schedulerCache.IsPodOrphaned(string(pod.UID))
+		ctx.schedulerCache.RemovePod(pod)
+		if !isOrphaned {
 			log.Log(log.ShimContext).Debug("pod terminated, trigger foreign resource update",
 				zap.String("namespace", pod.Namespace),
 				zap.String("podName", pod.Name),
 				zap.String("podStatusBefore", podStatusBefore),
 				zap.String("podStatusCurrent", string(pod.Status.Phase)))
-			// this means pod is terminated
-			// remove from the scheduler cache and create release request to remove foreign allocation from the core
-			ctx.schedulerCache.RemovePod(pod)
 			releaseReq := common.CreateReleaseRequestForForeignPod(string(pod.UID), constants.DefaultPartition)
 			if err := ctx.apiProvider.GetAPIs().SchedulerAPI.UpdateAllocation(releaseReq); err != nil {
 				log.Log(log.ShimContext).Error("failed to remove foreign allocation from the core",
@@ -687,58 +703,190 @@ func (ctx *Context) setConfigMap(index int, configMap *v1.ConfigMap) map[string]
 	return schedulerconf.FlattenConfigMaps(ctx.configMaps)
 }
 
-// EventsToRegister returns the Kubernetes events that should be watched for updates which may effect predicate processing
-func (ctx *Context) EventsToRegister(queueingHintFn fwk.QueueingHintFn) []fwk.ClusterEventWithHint {
-	return ctx.predManager.EventsToRegister(queueingHintFn)
+// PreFilter evaluates given prefilter based predicates based on current context
+func (ctx *Context) PreFilter(name string, allocate bool) *si.PreFilterPredicatesResponse {
+	ctx.lock.RLock()
+	defer ctx.lock.RUnlock()
+	pod := ctx.schedulerCache.GetPod(name)
+	if pod == nil {
+		log.Log(log.ShimContext).Error("prefilter failed",
+			zap.String("pod", name),
+			zap.Error(ErrorPodNotFound))
+		return &si.PreFilterPredicatesResponse{
+			FeasibleNodes: make(map[string]*si.Empty),
+			Success:       false,
+			ErrorMessage:  ErrorPodNotFound.Error(),
+		}
+	}
+	// if pod exists in cache, try to run predicates
+	// need to lock cache here as predicates need a stable view into the cache
+	ctx.schedulerCache.LockForReads()
+	feasibleNodes, cycleState, err := ctx.predManager.PreFilter(pod, allocate)
+	ctx.schedulerCache.UnlockForReads()
+	if err == nil {
+		ctx.schedulerCache.StoreCycleState(pod, cycleState)
+		return &si.PreFilterPredicatesResponse{
+			FeasibleNodes: feasibleNodes,
+			Success:       true,
+		}
+	}
+	return &si.PreFilterPredicatesResponse{
+		FeasibleNodes: make(map[string]*si.Empty),
+		Success:       false,
+		ErrorMessage:  err.Error(),
+	}
 }
 
 // IsPodFitNode evaluates given predicates based on current context
 func (ctx *Context) IsPodFitNode(name, node string, allocate bool) error {
 	ctx.lock.RLock()
 	defer ctx.lock.RUnlock()
-	pod := ctx.schedulerCache.GetPod(name)
-	if pod == nil {
-		return ErrorPodNotFound
-	}
-	// if pod exists in cache, try to run predicates
-	targetNode := ctx.schedulerCache.GetNode(node)
-	if targetNode == nil {
-		return ErrorNodeNotFound
+	pod, targetNode, cycleState, err := ctx.doPluginRequisiteChecks(name, node)
+	if err != nil {
+		log.Log(log.ShimContext).Error("filter failed",
+			zap.Error(err),
+			zap.String("pod", name),
+			zap.String("node", node))
+		return err
 	}
 	// need to lock cache here as predicates need a stable view into the cache
 	ctx.schedulerCache.LockForReads()
 	defer ctx.schedulerCache.UnlockForReads()
-	plugin, err := ctx.predManager.Predicates(pod, targetNode, allocate)
-	if err != nil {
-		err = errors.Join(fmt.Errorf("failed plugin: '%s'", plugin), err)
-	}
+	err = ctx.predManager.Filter(pod, targetNode, cycleState, allocate)
 	return err
 }
 
-func (ctx *Context) IsPodFitNodeViaPreemption(name, node string, allocations []string, startIndex int) (int, bool) {
+func (ctx *Context) IsPodFitNodeViaPreemption(name, node string, allocations []string, startIndex int) *si.PreemptionPredicatesResponse {
 	ctx.lock.RLock()
 	defer ctx.lock.RUnlock()
-	if pod := ctx.schedulerCache.GetPod(name); pod != nil {
-		// if pod exists in cache, try to run predicates
-		if targetNode := ctx.schedulerCache.GetNode(node); targetNode != nil {
-			// need to lock cache here as predicates need a stable view into the cache
-			ctx.schedulerCache.LockForReads()
-			defer ctx.schedulerCache.UnlockForReads()
-
-			// look up each victim in the scheduler cache
-			victims := make([]*v1.Pod, len(allocations))
-			for index, uid := range allocations {
-				victim := ctx.schedulerCache.GetPodNoLock(uid)
-				victims[index] = victim
-			}
-
-			// check predicates for a match
-			if index := ctx.predManager.PreemptionPredicates(pod, targetNode, victims, startIndex); index != -1 {
-				return index, true
-			}
+	pluginErrors := make(map[string]int32)
+	pod, targetNode, cycleState, err := ctx.doPluginRequisiteChecks(name, node)
+	if err != nil {
+		pluginErrors[err.Error()]++
+		log.Log(log.ShimContext).Error("failed running Preemption filter plugin",
+			zap.String("pod", name),
+			zap.Any("pluginErrors", pluginErrors))
+		return &si.PreemptionPredicatesResponse{
+			Success:      false,
+			Index:        -1,
+			ErrorMessage: pluginErrors,
 		}
 	}
-	return -1, false
+
+	// look up each victim in the scheduler cache
+	victims := make([]*v1.Pod, len(allocations))
+	for index, uid := range allocations {
+		victim := ctx.schedulerCache.GetPod(uid)
+		// Even "nil" victim would be added here and handled properly down the path
+		victims[index] = victim
+	}
+
+	// need to lock cache here as predicates need a stable view into the cache
+	ctx.schedulerCache.LockForReads()
+	defer ctx.schedulerCache.UnlockForReads()
+
+	// check predicates for a match
+	var index int
+	if index, pluginErrors = ctx.predManager.PreemptionFilter(pod, targetNode, cycleState, victims, startIndex); index != -1 {
+		return &si.PreemptionPredicatesResponse{
+			Success: true,
+			Index:   int32(index), // nolint:gosec
+		}
+	}
+	return &si.PreemptionPredicatesResponse{
+		Success:      false,
+		Index:        -1,
+		ErrorMessage: pluginErrors,
+	}
+}
+
+func (ctx *Context) doPluginRequisiteChecks(name, node string) (*v1.Pod, *framework.NodeInfo, *framework.CycleState, error) {
+	pod := ctx.schedulerCache.GetPod(name)
+	if pod == nil {
+		return nil, nil, nil, ErrorPodNotFound
+	}
+	// if pod exists in cache, try to run predicates
+	targetNode := ctx.schedulerCache.GetNode(node)
+	if targetNode == nil {
+		return nil, nil, nil, ErrorNodeNotFound
+	}
+
+	// if pod exists in cache, try to run predicates
+	cycleState := ctx.schedulerCache.GetCycleState(pod)
+	if cycleState == nil {
+		return nil, nil, nil, ErrorCycleStateNotFound
+	}
+	return pod, targetNode, cycleState, nil
+}
+
+// reserve Binding Cycle - reserve the node for binding process
+func (ctx *Context) reserve(name, node string) bool {
+	ctx.lock.RLock()
+	defer ctx.lock.RUnlock()
+	pod, targetNode, cycleState, err := ctx.doPluginRequisiteChecks(name, node)
+	if err != nil {
+		log.Log(log.ShimContext).Error("reserve failed",
+			zap.Error(err),
+			zap.String("pod", name),
+			zap.String("node", node))
+		return false
+	}
+	// need to lock cache here as predicates need a stable view into the cache
+	ctx.schedulerCache.LockForReads()
+	defer ctx.schedulerCache.UnlockForReads()
+	err = ctx.predManager.Reserve(pod, cycleState, targetNode)
+	if err != nil {
+		log.Log(log.ShimContext).Error("reserve failed",
+			zap.String("pod", name),
+			zap.String("node", node),
+			zap.Error(err))
+		return false
+	}
+	return true
+}
+
+// preBind Binding Cycle - preBind the node for binding process
+func (ctx *Context) preBind(name, node string) bool {
+	ctx.lock.RLock()
+	defer ctx.lock.RUnlock()
+	pod, targetNode, cycleState, err := ctx.doPluginRequisiteChecks(name, node)
+	if err != nil {
+		log.Log(log.ShimContext).Error("prebind failed",
+			zap.String("pod", name),
+			zap.String("node", node),
+			zap.Error(err))
+		return false
+	}
+	// need to lock cache here as predicates need a stable view into the cache
+	ctx.schedulerCache.LockForReads()
+	defer ctx.schedulerCache.UnlockForReads()
+	err = ctx.predManager.PreBind(pod, cycleState, targetNode)
+	if err != nil {
+		log.Log(log.ShimContext).Error("prebind failed",
+			zap.String("pod", name),
+			zap.String("node", node),
+			zap.Error(err))
+		return false
+	}
+	return true
+}
+
+// unreserve Binding Cycle - unreserve the node to clear out the binding work
+func (ctx *Context) unreserve(name, node string) {
+	ctx.lock.RLock()
+	defer ctx.lock.RUnlock()
+	pod, targetNode, cycleState, err := ctx.doPluginRequisiteChecks(name, node)
+	if err != nil {
+		log.Log(log.ShimContext).Error("unreserve failed",
+			zap.Error(err),
+			zap.String("pod", name),
+			zap.String("node", node))
+		return
+	}
+	// need to lock cache here as predicates need a stable view into the cache
+	ctx.schedulerCache.LockForReads()
+	defer ctx.schedulerCache.UnlockForReads()
+	ctx.predManager.Unreserve(pod, cycleState, targetNode)
 }
 
 // call volume binder to bind pod volumes if necessary,
@@ -1052,6 +1200,19 @@ func (ctx *Context) addApplication(request *AddApplicationRequest) *Application 
 	return app
 }
 
+// IsPodPreemptSelfAllowed returns whether the pod may be preempted: the pod annotation takes precedence,
+// otherwise the setting of its PriorityClass is used.
+func (ctx *Context) IsPodPreemptSelfAllowed(pod *v1.Pod) bool {
+	switch utils.GetPodAnnotationValue(pod, constants.AnnotationAllowPreemption) {
+	case constants.True:
+		return true
+	case constants.False:
+		return false
+	default:
+		return ctx.IsPreemptSelfAllowed(pod.Spec.PriorityClassName)
+	}
+}
+
 func (ctx *Context) IsPreemptSelfAllowed(priorityClassName string) bool {
 	priorityClass := ctx.schedulerCache.GetPriorityClass(priorityClassName)
 	if priorityClass == nil {
@@ -1081,12 +1242,23 @@ func (ctx *Context) getApplication(appID string) *Application {
 func (ctx *Context) RemoveApplication(appID string) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
-	ctx.removeApplication(appID)
-}
-
-func (ctx *Context) removeApplication(appID string) {
 	if _, exist := ctx.applications[appID]; !exist {
 		log.Log(log.ShimContext).Debug("Attempted to remove non-existent application", zap.String("appID", appID))
+		return
+	}
+	delete(ctx.applications, appID)
+}
+
+func (ctx *Context) RemoveCompletedApplication(appID string) {
+	ctx.lock.Lock()
+	defer ctx.lock.Unlock()
+	app, exist := ctx.applications[appID]
+	if !exist {
+		return
+	}
+	if !app.AreAllTasksTerminated() {
+		log.Log(log.ShimContext).Info("ignoring application completion from the core, tasks are still active",
+			zap.String("appID", appID))
 		return
 	}
 	delete(ctx.applications, appID)
@@ -1099,6 +1271,22 @@ func (ctx *Context) AddTask(request *AddTaskRequest) *Task {
 	return ctx.addTask(request)
 }
 
+// placeholderTaskAllowed reports whether a placeholder task may still be tracked for an
+// application in the given state. Placeholders are only valid while the application is
+// progressing towards or sitting in gang reservation; once it has left reservation any
+// newly observed placeholder is stale and must be ignored.
+func placeholderTaskAllowed(appState string) bool {
+	switch appState {
+	case ApplicationStates().New,
+		ApplicationStates().Submitted,
+		ApplicationStates().Accepted,
+		ApplicationStates().Reserving:
+		return true
+	default:
+		return false
+	}
+}
+
 func (ctx *Context) addTask(request *AddTaskRequest) *Task {
 	log.Log(log.ShimContext).Debug("AddTask",
 		zap.String("appID", request.Metadata.ApplicationID),
@@ -1106,6 +1294,18 @@ func (ctx *Context) addTask(request *AddTaskRequest) *Task {
 	if app := ctx.getApplication(request.Metadata.ApplicationID); app != nil {
 		existingTask := app.GetTask(request.Metadata.TaskID)
 		if existingTask == nil {
+			if request.Metadata.Placeholder && !placeholderTaskAllowed(app.GetApplicationState()) {
+				// the application has already left gang reservation, so this placeholder is
+				// stale and must not be tracked. the pod delete is driven by the placeholder
+				// manager and the cache entry is removed by the informer delete event, so
+				// nothing else is needed here.
+				log.Log(log.ShimContext).Info("ignoring placeholder pod, application left gang reservation",
+					zap.String("appID", app.applicationID),
+					zap.String("appState", app.GetApplicationState()),
+					zap.String("taskID", request.Metadata.TaskID))
+				return nil
+			}
+
 			var originator bool
 
 			// Is this task the originator of the application?
@@ -1229,12 +1429,12 @@ func (ctx *Context) PublishEvents(eventRecords []*si.EventRecord) {
 
 // update task's pod condition when the condition has not yet updated,
 // return true if the update was done and false if the update is skipped due to any error, or a dup operation
-func (ctx *Context) updatePodCondition(task *Task, podCondition *v1.PodCondition) bool {
+func (ctx *Context) updatePodCondition(stopCtx context.Context, task *Task, podCondition *v1.PodCondition) bool {
 	if task.GetTaskState() == TaskStates().Scheduling {
 		// only update the pod when pod condition changes
 		// minimize the overhead added to the api-server/etcd
 		if ok, podCopy := task.UpdatePodCondition(podCondition); ok {
-			_, err := ctx.apiProvider.GetAPIs().KubeClient.UpdateStatus(podCopy)
+			_, err := ctx.apiProvider.GetAPIs().KubeClient.UpdateStatus(stopCtx, podCopy)
 			if err == nil {
 				return true
 			}
@@ -1250,7 +1450,7 @@ func (ctx *Context) updatePodCondition(task *Task, podCondition *v1.PodCondition
 // this function handles the pod scheduling failures with respect to the different causes,
 // and update the pod condition accordingly. the cluster autoscaler depends on the certain
 // pod condition in order to trigger auto-scaling.
-func (ctx *Context) HandleContainerStateUpdate(request *si.UpdateContainerSchedulingStateRequest) {
+func (ctx *Context) HandleContainerStateUpdate(stopCtx context.Context, request *si.UpdateContainerSchedulingStateRequest) {
 	// the allocationKey equals to the taskID
 	if task := ctx.getTask(request.ApplicationID, request.AllocationKey); task != nil {
 		switch request.State {
@@ -1258,7 +1458,7 @@ func (ctx *Context) HandleContainerStateUpdate(request *si.UpdateContainerSchedu
 			// auto-scaler scans pods whose pod condition is PodScheduled=false && reason=Unschedulable
 			// if the pod is skipped because the queue quota has been exceeded, we do not trigger the auto-scaling
 			task.SetTaskSchedulingState(TaskSchedSkipped)
-			if ctx.updatePodCondition(task,
+			if ctx.updatePodCondition(stopCtx, task,
 				&v1.PodCondition{
 					Type:    v1.PodScheduled,
 					Status:  v1.ConditionFalse,
@@ -1266,13 +1466,13 @@ func (ctx *Context) HandleContainerStateUpdate(request *si.UpdateContainerSchedu
 					Message: request.Reason,
 				}) {
 				events.GetRecorder().Eventf(task.GetTaskPod().DeepCopy(), nil,
-					v1.EventTypeNormal, "PodUnschedulable", "PodUnschedulable",
+					v1.EventTypeWarning, "PodUnschedulable", "PodUnschedulable",
 					"Task %s is skipped from scheduling because the queue quota has been exceed", task.alias)
 			}
 		case si.UpdateContainerSchedulingStateRequest_FAILED:
 			task.SetTaskSchedulingState(TaskSchedFailed)
 			// set pod condition to Unschedulable in order to trigger auto-scaling
-			if ctx.updatePodCondition(task,
+			if ctx.updatePodCondition(stopCtx, task,
 				&v1.PodCondition{
 					Type:    v1.PodScheduled,
 					Status:  v1.ConditionFalse,
@@ -1280,7 +1480,7 @@ func (ctx *Context) HandleContainerStateUpdate(request *si.UpdateContainerSchedu
 					Message: request.Reason,
 				}) {
 				events.GetRecorder().Eventf(task.GetTaskPod().DeepCopy(), nil,
-					v1.EventTypeNormal, "PodUnschedulable", "PodUnschedulable",
+					v1.EventTypeWarning, "PodUnschedulable", "PodUnschedulable",
 					"Task %s is pending for the requested resources become available", task.alias)
 			}
 		default:

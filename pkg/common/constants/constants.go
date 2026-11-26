@@ -72,7 +72,7 @@ const DaemonSetType = "DaemonSet"
 const NodeKind = "Node"
 
 // Gang scheduling
-const PlaceholderContainerImage = "registry.k8s.io/pause:3.7"
+const PlaceholderContainerImage = "registry.k8s.io/pause:3.10.2"
 const PlaceholderContainerName = "pause"
 const PlaceholderPodRestartPolicy = "Never"
 
@@ -89,6 +89,7 @@ var SchedulingPolicyStyleParamValues = map[string]string{"Hard": "Hard", "Soft":
 
 const ApplicationInsufficientResourcesFailure = "ResourceReservationTimeout"
 const ApplicationRejectedFailure = "ApplicationRejected"
+const ApplicationPlaceholderCreateFailure = "PlaceholderCreateFailed"
 
 // namespace.max.* (Retaining for backwards compatibility. Need to be removed in next major release)
 const CPUQuota = DomainYuniKorn + "namespace.max.cpu"

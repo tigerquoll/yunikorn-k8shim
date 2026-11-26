@@ -37,34 +37,54 @@ import (
 
 type SchedulerKubeClient struct {
 	clientSet *kubernetes.Clientset
-	configs   *rest.Config
 }
 
-func newBootstrapSchedulerKubeClient(kc string) SchedulerKubeClient {
+// Every client identifies the concern it serves in its user agent so that the traffic can be
+// attributed on the API server side. That is all the concern is used for.
+const (
+	userAgentScheduler           = "yunikorn-scheduler"
+	userAgentEvents              = "yunikorn-scheduler/events"
+	userAgentBootstrap           = "yunikorn-bootstrap"
+	userAgentAdmissionController = "yunikorn-admission-controller"
+)
+
+// clientRateLimit turns the configured qps and burst into REST config values: qps < 0 means
+// no client side limiter, qps 0 gives client-go's 5 QPS with the configured burst (10 if that
+// is also 0), and for qps > 0 a burst <= 0 defaults to the qps.
+func clientRateLimit(qps, burst int) (float32, int) {
+	if burst <= 0 {
+		burst = max(0, qps)
+	}
+	return float32(max(-1, qps)), burst
+}
+
+// newRestConfig creates a REST config for a single purpose client, see clientRateLimit for
+// the way the configured qps and burst are applied.
+func newRestConfig(kc string, qps, burst int, concern string) *rest.Config {
 	config := CreateRestConfigOrDie(kc)
+	config.UserAgent = concern
+	config.QPS, config.Burst = clientRateLimit(qps, burst)
+
+	log.Log(log.ShimClient).Info("creating Kubernetes client",
+		zap.String("concern", concern),
+		zap.Float32("qps", config.QPS),
+		zap.Int("burst", config.Burst))
+	return config
+}
+
+func newClientSetOrDie(config *rest.Config) *kubernetes.Clientset {
 	configuredClient, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		log.Log(log.ShimClient).Fatal("failed to get Clientset", zap.Error(err))
 	}
-	return SchedulerKubeClient{
-		clientSet: configuredClient,
-		configs:   config,
-	}
+	return configuredClient
 }
 
-func newSchedulerKubeClient(kc string) SchedulerKubeClient {
-	schedulerConf := conf.GetSchedulerConf()
-
-	config := CreateRestConfigOrDie(kc)
-	config.QPS = float32(schedulerConf.KubeQPS)
-	config.Burst = schedulerConf.KubeBurst
-	configuredClient, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		log.Log(log.ShimClient).Fatal("failed to get Clientset", zap.Error(err))
-	}
+// newKubeClient creates a client for a single concern. The caller passes qps and burst: the
+// configuration singleton is only populated after UpdateConfigMaps has run.
+func newKubeClient(kc string, qps, burst int, concern string) SchedulerKubeClient {
 	return SchedulerKubeClient{
-		clientSet: configuredClient,
-		configs:   config,
+		clientSet: newClientSetOrDie(newRestConfig(kc, qps, burst, concern)),
 	}
 }
 
@@ -104,10 +124,6 @@ func (nc SchedulerKubeClient) GetClientSet() kubernetes.Interface {
 	return nc.clientSet
 }
 
-func (nc SchedulerKubeClient) GetConfigs() *rest.Config {
-	return nc.configs
-}
-
 func (nc SchedulerKubeClient) Bind(pod *v1.Pod, hostID string) error {
 	log.Log(log.ShimClient).Info("bind pod to node",
 		zap.String("podName", pod.Name),
@@ -133,16 +149,18 @@ func (nc SchedulerKubeClient) Bind(pod *v1.Pod, hostID string) error {
 	return nil
 }
 
-func (nc SchedulerKubeClient) Create(pod *v1.Pod) (*v1.Pod, error) {
-	return nc.clientSet.CoreV1().Pods(pod.Namespace).Create(context.Background(), pod, apis.CreateOptions{})
+func (nc SchedulerKubeClient) Create(ctx context.Context, pod *v1.Pod) (*v1.Pod, error) {
+	return nc.clientSet.CoreV1().Pods(pod.Namespace).Create(ctx, pod, apis.CreateOptions{})
 }
 
-func (nc SchedulerKubeClient) Delete(pod *v1.Pod) error {
-	if err := nc.clientSet.CoreV1().Pods(pod.Namespace).Delete(context.Background(), pod.Name, apis.DeleteOptions{}); err != nil {
-		log.Log(log.ShimClient).Warn("failed to delete pod",
-			zap.String("namespace", pod.Namespace),
-			zap.String("podName", pod.Name),
-			zap.Error(err))
+func (nc SchedulerKubeClient) Delete(ctx context.Context, pod *v1.Pod) error {
+	if err := nc.clientSet.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, apis.DeleteOptions{}); err != nil {
+		if !errors.IsNotFound(err) {
+			log.Log(log.ShimClient).Warn("failed to delete pod",
+				zap.String("namespace", pod.Namespace),
+				zap.String("podName", pod.Name),
+				zap.Error(err))
+		}
 		return err
 	}
 	return nil
@@ -160,54 +178,7 @@ func (nc SchedulerKubeClient) GetConfigMap(namespace string, name string) (*v1.C
 	return configmap, nil
 }
 
-func (nc SchedulerKubeClient) Get(podNamespace string, podName string) (*v1.Pod, error) {
-	pod, err := nc.clientSet.CoreV1().Pods(podNamespace).Get(context.Background(), podName, apis.GetOptions{})
-	if err != nil {
-		log.Log(log.ShimClient).Warn("failed to get pod",
-			zap.String("namespace", pod.Namespace),
-			zap.String("podName", pod.Name),
-			zap.Error(err))
-		return nil, err
-	}
-	return pod, nil
-}
-
-func (nc SchedulerKubeClient) UpdatePod(pod *v1.Pod, podMutator func(pod *v1.Pod)) (*v1.Pod, error) {
-	var updatedPod *v1.Pod
-	var updateErr error
-	// Retrieve the latest version of Pod before attempting update
-	// RetryOnConflict uses exponential backoff to avoid exhausting the API server
-	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latestPod, getErr := nc.clientSet.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, apis.GetOptions{})
-		if getErr != nil {
-			log.Log(log.ShimClient).Warn("failed to get latest version of Pod",
-				zap.Error(getErr))
-		}
-		// allow mutator to update pod
-		podMutator(latestPod)
-		if updatedPod, updateErr = nc.clientSet.CoreV1().Pods(pod.Namespace).Update(context.Background(), latestPod, apis.UpdateOptions{}); updateErr != nil {
-			log.Log(log.ShimClient).Warn("failed to update pod",
-				zap.String("namespace", pod.Namespace),
-				zap.String("podName", pod.Name),
-				zap.Error(updateErr))
-			return updateErr
-		}
-		return nil
-	})
-	if retryErr != nil {
-		log.Log(log.ShimClient).Error("Update pod failed",
-			zap.String("namespace", pod.Namespace),
-			zap.String("podName", pod.Name),
-			zap.Error(retryErr))
-		return pod, retryErr
-	}
-	log.Log(log.ShimClient).Info("Successfully updated pod",
-		zap.String("namespace", pod.Namespace),
-		zap.String("podName", pod.Name))
-	return updatedPod, nil
-}
-
-func (nc SchedulerKubeClient) UpdateStatus(pod *v1.Pod) (*v1.Pod, error) {
+func (nc SchedulerKubeClient) UpdateStatus(ctx context.Context, pod *v1.Pod) (*v1.Pod, error) {
 	var updatedPod *v1.Pod
 	var updateErr error
 	newPodStatus := pod.Status
@@ -216,14 +187,14 @@ func (nc SchedulerKubeClient) UpdateStatus(pod *v1.Pod) (*v1.Pod, error) {
 	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		// Retrieve the latest version of Pod before attempting status update
 		// RetryOnConflict uses exponential backoff to avoid exhausting the API server
-		latestPod, getErr := nc.clientSet.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, apis.GetOptions{})
+		latestPod, getErr := nc.clientSet.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, apis.GetOptions{})
 		if getErr != nil {
 			log.Log(log.ShimClient).Warn("failed to get latest version of Pod",
 				zap.Error(getErr))
 		}
 		latestPod.Status = newPodStatus
 
-		if updatedPod, updateErr = nc.clientSet.CoreV1().Pods(pod.Namespace).UpdateStatus(context.Background(), latestPod, apis.UpdateOptions{}); updateErr != nil {
+		if updatedPod, updateErr = nc.clientSet.CoreV1().Pods(pod.Namespace).UpdateStatus(ctx, latestPod, apis.UpdateOptions{}); updateErr != nil {
 			log.Log(log.ShimClient).Warn("failed to update pod status",
 				zap.String("namespace", pod.Namespace),
 				zap.String("podName", pod.Name),
@@ -232,6 +203,10 @@ func (nc SchedulerKubeClient) UpdateStatus(pod *v1.Pod) (*v1.Pod, error) {
 		}
 		return nil
 	})
+	// RetryOnConflict reports a cancelled context as success when no conflict preceded it
+	if retryErr == nil {
+		retryErr = updateErr
+	}
 	if retryErr != nil {
 		log.Log(log.ShimClient).Error("Update pod status failed",
 			zap.String("namespace", pod.Namespace),

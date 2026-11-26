@@ -33,8 +33,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	k8sEvents "k8s.io/client-go/tools/events"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/volumebinding"
 
+	"github.com/apache/yunikorn-k8shim/pkg/cache/external"
 	"github.com/apache/yunikorn-k8shim/pkg/client"
 	"github.com/apache/yunikorn-k8shim/pkg/common/constants"
 	"github.com/apache/yunikorn-k8shim/pkg/common/events"
@@ -46,6 +48,10 @@ import (
 )
 
 func TestTaskStateTransitions(t *testing.T) {
+	recorder := k8sEvents.NewFakeRecorder(1024)
+	events.SetRecorder(recorder)
+	defer events.SetRecorder(events.NewMockedRecorder())
+
 	mockedSchedulerApi := newMockSchedulerAPI()
 	mockedContext := initContextForTest()
 	resources := make(map[v1.ResourceName]resource.Quantity)
@@ -98,6 +104,7 @@ func TestTaskStateTransitions(t *testing.T) {
 	err = task.handle(event3)
 	assert.NilError(t, err, "failed to handle BindTask event")
 	assert.Equal(t, task.GetTaskState(), TaskStates().Bound)
+	waitForPodBindSuccessful(t, recorder)
 
 	// complete
 	event4 := NewSimpleTaskEvent(app.applicationID, task.taskID, CompleteTask)
@@ -155,6 +162,10 @@ func TestTaskIllegalEventHandling(t *testing.T) {
 
 //nolint:funlen
 func TestReleaseTaskAllocation(t *testing.T) {
+	recorder := k8sEvents.NewFakeRecorder(1024)
+	events.SetRecorder(recorder)
+	defer events.SetRecorder(events.NewMockedRecorder())
+
 	mockedSchedulerApi := newMockSchedulerAPI()
 	mockedContext := initContextForTest()
 	apiProvider := mockedContext.apiProvider
@@ -205,21 +216,13 @@ func TestReleaseTaskAllocation(t *testing.T) {
 	err = task.handle(event2)
 	assert.NilError(t, err, "failed to handle AllocateTask event")
 	assert.Equal(t, task.GetTaskState(), TaskStates().Allocated)
-	// bind a task is a async process, wait for it to happen
-	err = utils.WaitForCondition(
-		func() bool {
-			return task.GetNodeName() == "node-1"
-		},
-		100*time.Millisecond,
-		3*time.Second,
-	)
-	assert.NilError(t, err, "failed to wait for allocation allocationKey being set for task")
 
 	// bound
 	event3 := NewBindTaskEvent(app.applicationID, task.taskID)
 	err = task.handle(event3)
 	assert.NilError(t, err, "failed to handle BindTask event")
 	assert.Equal(t, task.GetTaskState(), TaskStates().Bound)
+	waitForPodBindSuccessful(t, recorder)
 
 	// the mocked update function does nothing than verify the coming messages
 	// this is to verify we are sending correct info to the scheduler core
@@ -270,6 +273,24 @@ func TestReleaseTaskAllocation(t *testing.T) {
 	})
 	err = task.handle(NewFailTaskEvent(app.applicationID, "task01", "test failure"))
 	assert.NilError(t, err, "failed to handle FailTask event")
+}
+
+// Bound can be reached before the binding goroutine records its final event.
+// Wait for that event before the test replaces the global recorder.
+func waitForPodBindSuccessful(t *testing.T, recorder *k8sEvents.FakeRecorder) {
+	t.Helper()
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case event := <-recorder.Events:
+			if strings.HasPrefix(event, "Normal PodBindSuccessful ") {
+				return
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for PodBindSuccessful")
+		}
+	}
 }
 
 func TestReleaseTaskAsk(t *testing.T) {
@@ -613,6 +634,39 @@ func TestHandleSubmitTaskEvent(t *testing.T) {
 	assert.Assert(t, allocRequest.Allocations[0].PreemptionPolicy != nil)
 	assert.Assert(t, !allocRequest.Allocations[0].PreemptionPolicy.AllowPreemptSelf)
 	assert.Assert(t, allocRequest.Allocations[0].PreemptionPolicy.AllowPreemptOther)
+}
+
+// a failed task must be reported as a Warning: the type decides if the event survives the
+// kubernetes.eventLevel filter
+func TestBeforeTaskFailEventType(t *testing.T) {
+	recorder := &eventTypeRecorder{}
+	events.SetRecorder(recorder)
+	defer events.SetRecorder(events.NewMockedRecorder())
+
+	mockedContext, mockedAPIProvider := initContextAndAPIProviderForTest()
+	pod := &v1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Pod",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod-test-00001",
+			UID:  "UID-00001",
+		},
+	}
+	app := NewApplication("app01", "root.default",
+		"bob", testGroups, map[string]string{}, mockedAPIProvider.GetAPIs().SchedulerAPI)
+	task := NewTask("task01", app, mockedContext, pod)
+	task.sm.SetState(TaskStates().Scheduling)
+
+	err := task.handle(NewFailTaskEvent(app.GetApplicationID(), task.GetTaskID(), "task failed"))
+	assert.NilError(t, err, "failed to handle FailTask event")
+	assert.Equal(t, task.GetTaskState(), TaskStates().Failed)
+
+	recorded := recorder.events()
+	assert.Equal(t, 1, len(recorded), "one event expected")
+	assert.Equal(t, "TaskFailed", recorded[0].reason, "unexpected event reason")
+	assert.Equal(t, v1.EventTypeWarning, recorded[0].eventType, "unexpected event type")
 }
 
 func TestSimultaneousTaskCompleteAndAllocate(t *testing.T) {
@@ -1031,10 +1085,35 @@ func TestRollbackOnAssumePodFailure_NilSchedulerAPI(t *testing.T) {
 
 // newBindTestPod returns a minimal pod usable for exercising the bind path.
 func newBindTestPod(name, uid string) *v1.Pod {
+	var volumes []v1.Volume
+	volumes = append(volumes, v1.Volume{
+		Name:         "test",
+		VolumeSource: v1.VolumeSource{},
+	})
 	return &v1.Pod{
 		TypeMeta:   metav1.TypeMeta{Kind: "Pod", APIVersion: "v1"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(uid)},
+		Spec: v1.PodSpec{
+			Volumes: volumes,
+		},
 	}
+}
+
+// newDRATestPod returns a minimal pod usable for exercising the dra bindings
+func newDRATestPod(name, uid string) *v1.Pod {
+	var claims []v1.PodResourceClaim
+	claim := v1.PodResourceClaim{
+		Name: "test",
+	}
+	claims = append(claims, claim)
+	draPod := &v1.Pod{
+		TypeMeta:   metav1.TypeMeta{Kind: "Pod", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(uid)},
+		Spec: v1.PodSpec{
+			ResourceClaims: claims,
+		},
+	}
+	return draPod
 }
 
 // setShortBindBackoff shrinks the bind retry backoff so tests do not wait for the
@@ -1085,6 +1164,8 @@ func TestPostTaskAllocated_BindRetrySucceeds(t *testing.T) {
 	events.SetRecorder(events.NewMockedRecorder())
 	defer events.SetRecorder(events.NewMockedRecorder())
 	defer setShortBindBackoff(5)()
+	dispatcher.Start()
+	defer dispatcher.Stop()
 
 	var bindCalls atomic.Int32
 	apiProvider.MockBindFn(func(_ *v1.Pod, _ string) error {
@@ -1149,6 +1230,83 @@ func TestPostTaskAllocated_BindExhaustedReschedules(t *testing.T) {
 	assert.Equal(t, "", task.GetAllocationKey(), "allocationKey should be cleared after rollback")
 	assert.Equal(t, "", task.GetNodeName(), "nodeName should be cleared after rollback")
 	assert.Assert(t, rollbackSent.Load(), "SCHEDULING_FAILED_ON_RM release request should be sent")
+}
+
+// TestPostTaskAllocatedWithDRABindings verifies that when pod DRA binding keeps
+// failing, the allocation is rolled back and the task returns to Scheduling.
+func TestPostTaskAllocatedWithDRABindings(t *testing.T) {
+	events.SetRecorder(events.NewMockedRecorder())
+	defer events.SetRecorder(events.NewMockedRecorder())
+	defer setShortBindBackoff(5)()
+	dispatcher.Start()
+	defer dispatcher.Stop()
+
+	tests := []struct {
+		name             string
+		failReserve      bool
+		failPreBind      bool
+		shouldReschedule bool
+	}{
+		{"success", false, false, false},
+		{"fail reserve", true, false, true},
+		{"fail prebind", false, true, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			draTestPod := newDRATestPod("dra-bind-fail-pod", "dra-bind-fail-uid")
+			apis := client.NewMockedAPIProvider(false)
+			cache := external.NewSchedulerCache(apis.GetAPIs())
+			node2 := &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fakeNodeName,
+					Namespace: "default",
+					UID:       "node-uid-1",
+				},
+				Status: v1.NodeStatus{},
+				Spec: v1.NodeSpec{
+					Unschedulable: false,
+				},
+			}
+			cache.UpdateNode(node2)
+			draTestPod.Spec.NodeName = node2.Name
+			cache.UpdatePod(draTestPod)
+			cache.StoreCycleState(draTestPod, framework.NewCycleState())
+
+			mockedContext, apiProvider := initContextWithMockedPredicateManager(apis, NewMockPredicateManager(false, false, false, tt.failReserve, tt.failPreBind), cache)
+
+			var rollbackSent atomic.Bool
+			if tt.shouldReschedule {
+				apiProvider.MockSchedulerAPIUpdateAllocationFn(func(request *si.AllocationRequest) error {
+					if request.Releases != nil {
+						for _, rel := range request.Releases.AllocationsToRelease {
+							if rel.TerminationType == si.TerminationType_SCHEDULING_FAILED_ON_RM {
+								rollbackSent.Store(true)
+							}
+						}
+					}
+					return nil
+				})
+			}
+			app := NewApplication(appID1, queueNameA, testUser, testGroups, map[string]string{},
+				apiProvider.GetAPIs().SchedulerAPI)
+			task := NewTask(taskUID1, app, mockedContext, draTestPod)
+			task.sm.SetState(TaskStates().Scheduling)
+			err := task.handle(NewAllocateTaskEvent(app.applicationID, task.taskID, taskUID1, fakeNodeName))
+			assert.NilError(t, err, "failed to handle AllocateTask event")
+			if tt.shouldReschedule {
+				err = utils.WaitForCondition(func() bool {
+					return task.GetTaskState() == TaskStates().Scheduling
+				}, 10*time.Millisecond, 3*time.Second)
+				assert.NilError(t, err, "task should be moved back to Scheduling after bind exhaustion")
+				assert.Equal(t, "", task.GetAllocationKey(), "allocationKey should be cleared after rollback")
+				assert.Equal(t, "", task.GetNodeName(), "nodeName should be cleared after rollback")
+				assert.Assert(t, rollbackSent.Load(), "SCHEDULING_FAILED_ON_RM release request should be sent")
+			} else {
+				assert.Assert(t, !rollbackSent.Load(), "SCHEDULING_FAILED_ON_RM release request should not be sent")
+			}
+		})
+	}
 }
 
 // TestPostTaskAllocated_VolumeBindExhaustedReschedules verifies that when volume binding
@@ -1252,4 +1410,85 @@ func TestPostTaskAllocated_VolumeBindNoRetryOnBindingVolumesError(t *testing.T) 
 	assert.Equal(t, "", task.GetAllocationKey(), "allocationKey should be cleared after rollback")
 	assert.Equal(t, "", task.GetNodeName(), "nodeName should be cleared after rollback")
 	assert.Assert(t, rollbackSent.Load(), "SCHEDULING_FAILED_ON_RM release request should be sent")
+}
+
+// A release must not retain either FSM lock: core callbacks may update the
+// recovered task state, and another task event may need the event mutex.
+func TestTaskReleaseOutsideFSMLocks(t *testing.T) {
+	for _, eventType := range []TaskEventType{CompleteTask, TaskFail, TaskAllocated} {
+		for _, probe := range []string{"event mutex", "state mutex"} {
+			t.Run(eventType.String()+"/"+probe, func(t *testing.T) {
+				ctx := initContextForTest()
+				provider, ok := ctx.apiProvider.(*client.MockedAPIProvider)
+				assert.Assert(t, ok)
+				app := NewApplication("release-app", "root.default", "user", nil, nil, newMockSchedulerAPI())
+				app.sm.SetState(ApplicationStates().Running)
+				task := NewTask("release-task", app, ctx, &v1.Pod{})
+				var event events.TaskEvent
+				switch eventType {
+				case CompleteTask:
+					event = NewSimpleTaskEvent(app.applicationID, task.taskID, CompleteTask)
+				case TaskFail:
+					event = NewFailTaskEvent(app.applicationID, task.taskID, "test failure")
+				case TaskAllocated:
+					task.sm.SetState(TaskStates().Completed)
+					event = NewAllocateTaskEvent(app.applicationID, task.taskID, task.taskID, "node-1")
+				}
+				probeDone := make(chan struct{})
+				called := false
+				provider.MockSchedulerAPIUpdateAllocationFn(func(request *si.AllocationRequest) error {
+					called = true
+					assert.Equal(t, request.Releases.AllocationsToRelease[0].AllocationKey, task.taskID)
+					go func() {
+						if probe == "event mutex" {
+							task.sm.Can(CompleteTask.String())
+						} else {
+							task.sm.SetState(task.sm.Current())
+						}
+						close(probeDone)
+					}()
+					select {
+					case <-probeDone:
+					case <-time.After(time.Second):
+						t.Errorf("release holds FSM %s", probe)
+					}
+					return nil
+				})
+				assert.NilError(t, task.handle(event))
+				assert.Assert(t, called, "release must run, including Completed -> Completed")
+				select {
+				case <-probeDone:
+				case <-time.After(time.Second):
+					t.Fatal("FSM probe did not finish after event returned")
+				}
+			})
+		}
+	}
+}
+
+// Application event handlers hold app.lock while inspecting tasks. Task
+// completion must therefore be able to defer its release without this lock.
+func TestTaskDeferredReleaseWithApplicationLocked(t *testing.T) {
+	ctx := initContextForTest()
+	provider, ok := ctx.apiProvider.(*client.MockedAPIProvider)
+	assert.Assert(t, ok)
+	app := NewApplication("deferred-app", "root.default", "user", nil, nil, newMockSchedulerAPI())
+	task := NewTask("deferred-task", app, ctx, &v1.Pod{})
+	app.lock.Lock()
+	done := make(chan error, 1)
+	go func() {
+		done <- task.handle(NewSimpleTaskEvent(app.applicationID, task.taskID, CompleteTask))
+	}()
+	select {
+	case err := <-done:
+		app.lock.Unlock()
+		assert.NilError(t, err)
+	case <-time.After(time.Second):
+		app.lock.Unlock()
+		assert.NilError(t, <-done)
+		t.Fatal("task release waits for application lock")
+	}
+	assert.Equal(t, task.GetTaskState(), TaskStates().Completed)
+	assert.Equal(t, len(app.releaseableTasks), 1)
+	assert.Equal(t, provider.GetSchedulerAPIUpdateAllocationCount(), int32(0))
 }

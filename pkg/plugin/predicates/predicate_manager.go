@@ -22,11 +22,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 
 	"go.uber.org/zap"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/component-base/config/v1alpha1"
 	"k8s.io/klog/v2"
@@ -36,22 +36,28 @@ import (
 	apiConfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/scheme"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	"k8s.io/kubernetes/pkg/scheduler/framework/plugins"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	fwruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 
 	"github.com/apache/yunikorn-k8shim/pkg/log"
+	"github.com/apache/yunikorn-scheduler-interface/lib/go/si"
 )
 
 type PredicateManager interface {
-	EventsToRegister(queueingHintFn fwk.QueueingHintFn) []fwk.ClusterEventWithHint
-	// Predicates checks if a pod can fit on a node.
+	PreFilter(pod *v1.Pod, allocate bool) (feasibleNodes map[string]*si.Empty, cycleState *framework.CycleState, error error)
+	// Filter Predicates checks if a pod can fit on a node.
 	// Returns the name of the predicate plugin that failed (may be empty) and any error encountered.
-	Predicates(pod *v1.Pod, node *framework.NodeInfo, allocate bool) (string, error)
+	Filter(pod *v1.Pod, node *framework.NodeInfo, cycleState *framework.CycleState, allocate bool) (error error)
 	// PreemptionPredicates checks if a pod can be scheduled on the node by preempting victims.
 	// Returns the victim index that allows the pod to fit, or -1 if none.
-	PreemptionPredicates(pod *v1.Pod, node *framework.NodeInfo, victims []*v1.Pod, startIndex int) int
+	PreemptionFilter(pod *v1.Pod, node *framework.NodeInfo, cycleState *framework.CycleState, victims []*v1.Pod, startIndex int) (index int, filterErrors map[string]int32)
+	// Reserve Binding cycle - Reserve the node
+	Reserve(pod *v1.Pod, cycleState *framework.CycleState, node *framework.NodeInfo) error
+	// PreBind Binding cycle - PreBind the node
+	PreBind(pod *v1.Pod, cycleState *framework.CycleState, node *framework.NodeInfo) error
+	// Unreserve Binding cycle - Unreserve the node
+	Unreserve(pod *v1.Pod, cycleState *framework.CycleState, node *framework.NodeInfo)
 }
 
 var _ PredicateManager = &predicateManagerImpl{}
@@ -63,111 +69,45 @@ type predicateManagerImpl struct {
 	allocationPreFilters  *[]fwk.PreFilterPlugin
 	reservationFilters    *[]fwk.FilterPlugin
 	allocationFilters     *[]fwk.FilterPlugin
+	reservePlugins        *[]fwk.ReservePlugin
+	preBindPlugins        *[]fwk.PreBindPlugin
 	klogger               klog.Logger
 	sharedLister          fwk.SharedLister
 }
 
-func (p *predicateManagerImpl) EventsToRegister(queueingHintFn fwk.QueueingHintFn) []fwk.ClusterEventWithHint {
-	actionMap := make(map[fwk.EventResource]fwk.ActionType)
-	for _, plugin := range *p.allocationPreFilters {
-		mergePluginEvents(actionMap, pluginEvents(plugin))
-	}
-	for _, plugin := range *p.allocationFilters {
-		mergePluginEvents(actionMap, pluginEvents(plugin))
-	}
-	return buildClusterEvents(actionMap, queueingHintFn)
-}
-
-func pluginEvents(plugin fwk.Plugin) []fwk.ClusterEventWithHint {
-	ext, ok := plugin.(fwk.EnqueueExtensions)
-	if !ok {
-		// legacy plugins that don't register for EnqueueExtensions get a default list of events
-		return framework.UnrollWildCardResource()
-	}
-	events, err := ext.EventsToRegister(context.Background())
-	if err != nil {
-		log.Log(log.ShimPredicates).Fatal("Failed to configure predicate plugin", zap.String("name", ext.Name()), zap.Error(err))
-	}
-	return events
-}
-
-func mergePluginEvents(actionMap map[fwk.EventResource]fwk.ActionType, events []fwk.ClusterEventWithHint) {
-	if _, ok := actionMap[fwk.WildCard]; ok {
-		// already registered for all events; skip further processing
-		return
-	}
-	for _, event := range events {
-		if IsWildCard(event.Event) {
-			// clear existing entries and add a wildcard entry
-			for k := range actionMap {
-				delete(actionMap, k)
-			}
-			actionMap[fwk.WildCard] = fwk.All
-			return
-		}
-		action, ok := actionMap[event.Event.Resource]
-		if !ok {
-			action = event.Event.ActionType
-		} else {
-			action |= event.Event.ActionType
-		}
-		actionMap[event.Event.Resource] = action
-	}
-}
-
-func buildClusterEvents(actionMap map[fwk.EventResource]fwk.ActionType, queueingHintFn fwk.QueueingHintFn) []fwk.ClusterEventWithHint {
-	events := make([]fwk.ClusterEventWithHint, 0)
-	for resource, actionType := range actionMap {
-		events = append(events, fwk.ClusterEventWithHint{
-			Event: fwk.ClusterEvent{
-				Resource:   resource,
-				ActionType: actionType},
-			QueueingHintFn: queueingHintFn,
-		})
-	}
-	sort.SliceStable(events, func(i, j int) bool {
-		return events[i].Event.Resource < events[j].Event.Resource
-	})
-	return events
-}
-
-func (p *predicateManagerImpl) Predicates(pod *v1.Pod, node *framework.NodeInfo, allocate bool) (string, error) {
-	if allocate {
-		return p.predicatesAllocate(pod, node)
-	}
-	return p.predicatesReserve(pod, node)
-}
-
-func (p *predicateManagerImpl) PreemptionPredicates(pod *v1.Pod, node *framework.NodeInfo, victims []*v1.Pod, startIndex int) int {
+func (p *predicateManagerImpl) PreemptionFilter(pod *v1.Pod, node *framework.NodeInfo, cycleState *framework.CycleState, victims []*v1.Pod, startIndex int) (int, map[string]int32) {
 	ctx := context.Background()
-	state := framework.NewCycleState()
-
-	// run prefilter checks as pod cannot be scheduled otherwise
-	s, plugin, skip := p.runPreFilterPlugins(ctx, state, *p.allocationPreFilters, pod, node)
-	if !s.IsSuccess() && !s.IsSkip() {
-		// prefilter check failed, log and return
-		log.Log(log.ShimPredicates).Debug("PreFilter check failed during preemption check",
-			zap.String("podUID", string(pod.UID)),
-			zap.String("plugin", plugin),
-			zap.String("message", s.Message()))
-
-		return -1
-	}
 
 	// clone node so that we can modify it here for predicate checks
 	preemptingNode := node.Snapshot()
 
+	stateCopy := framework.NewCycleState()
+	if cycleState != nil {
+		if cs, ok := cycleState.Clone().(*framework.CycleState); ok {
+			stateCopy = cs
+		}
+	}
+
+	pluginErrors := make(map[string]int32)
 	// remove pods up through startIndex -- all of these are required to be removed to satisfy resource constraints
 	for i := 0; i < startIndex && i < len(victims); i++ {
-		p.removePodFromNodeNoFail(preemptingNode, victims[i])
+		if err := p.removePod(ctx, preemptingNode, stateCopy, pod, victims[i]); err != nil {
+			pluginErrors[err.Error()]++
+			return -1, pluginErrors
+		}
 	}
 
 	// loop through remaining pods
 	for i := startIndex; i < len(victims); i++ {
-		p.removePodFromNodeNoFail(preemptingNode, victims[i])
-		status, _ := p.runFilterPlugins(ctx, *p.allocationFilters, state, pod, preemptingNode, skip)
+		if err := p.removePod(ctx, preemptingNode, stateCopy, pod, victims[i]); err != nil {
+			pluginErrors[err.Error()]++
+			return -1, pluginErrors
+		}
+		status := p.runFilterPlugins(ctx, *p.allocationFilters, stateCopy, pod, preemptingNode)
 		if status.IsSuccess() {
-			return i
+			return i, nil
+		} else {
+			pluginErrors[status.Message()]++
 		}
 	}
 
@@ -175,115 +115,183 @@ func (p *predicateManagerImpl) PreemptionPredicates(pod *v1.Pod, node *framework
 	log.Log(log.ShimPredicates).Debug("Filter checks failed during preemption check, no fit",
 		zap.String("podUID", string(pod.UID)),
 		zap.String("nodeID", node.Node().Name))
-	return -1
+	return -1, pluginErrors
 }
 
-func (p *predicateManagerImpl) removePodFromNodeNoFail(node fwk.NodeInfo, pod *v1.Pod) {
-	if pod == nil {
-		return
+func (p *predicateManagerImpl) Reserve(pod *v1.Pod, cycleState *framework.CycleState, node *framework.NodeInfo) error {
+	reservePl := *p.reservePlugins
+	for _, pl := range reservePl {
+		plugin := pl.Name()
+		status := pl.Reserve(context.Background(), cycleState, pod, node.Node().Name)
+		if !status.IsSuccess() {
+			err := errors.New(status.Message())
+			log.Log(log.ShimPredicates).Error("failed running reserve plugin",
+				zap.String("pluginName", plugin),
+				zap.String("pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)),
+				zap.Error(err))
+			return err
+		}
 	}
-	if err := node.RemovePod(p.klogger, pod); err != nil {
-		// annoyingly, RemovePod() throws an error if the pod is gone; just log at debug and continue
+	return nil
+}
+
+func (p *predicateManagerImpl) PreBind(pod *v1.Pod, cycleState *framework.CycleState, node *framework.NodeInfo) error {
+	preBindPl := *p.preBindPlugins
+	for _, pl := range preBindPl {
+		plugin := pl.Name()
+		status := pl.PreBind(context.Background(), cycleState, pod, node.Node().Name)
+		if !status.IsSuccess() {
+			err := errors.New(status.Message())
+			log.Log(log.ShimPredicates).Error("failed running preBind plugin",
+				zap.String("pluginName", plugin),
+				zap.String("pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)),
+				zap.Error(err))
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *predicateManagerImpl) Unreserve(pod *v1.Pod, cycleState *framework.CycleState, node *framework.NodeInfo) {
+	reservePl := *p.reservePlugins
+	for _, pl := range reservePl {
+		pl.Unreserve(context.Background(), cycleState, pod, node.Node().Name)
+	}
+}
+
+func (p *predicateManagerImpl) removePod(ctx context.Context, node fwk.NodeInfo, state *framework.CycleState, podToSchedule *v1.Pod, victim *v1.Pod) error {
+	if victim == nil {
+		return nil
+	}
+	if err := node.RemovePod(p.klogger, victim); err != nil {
 		log.Log(log.ShimPredicates).Debug("Failed to remove pod from nodeInfo during preemption check",
-			zap.String("podUID", string(pod.UID)),
-			zap.String("nodeID", node.Node().Name),
+			zap.String("podUID", string(victim.UID)),
 			zap.Error(err))
+		return nil
 	}
+	podInfo, err := framework.NewPodInfo(victim)
+	if err != nil {
+		return err
+	}
+	var skipPlugins sets.Set[string]
+	if state != nil {
+		skipPlugins = state.GetSkipFilterPlugins()
+	}
+	for _, pl := range *p.allocationPreFilters {
+		if skipPlugins.Has(pl.Name()) {
+			continue
+		}
+		if ext := pl.PreFilterExtensions(); ext != nil {
+			if status := ext.RemovePod(ctx, state, podToSchedule, podInfo, node); !status.IsSuccess() {
+				log.Log(log.ShimPredicates).Debug("Failed to remove pod in prefilter extension",
+					zap.String("plugin", pl.Name()),
+					zap.String("podUID", string(victim.UID)),
+					zap.String("status", status.Message()))
+				return status.AsError()
+			}
+		}
+	}
+	return nil
 }
 
-func (p *predicateManagerImpl) predicatesReserve(pod *v1.Pod, node *framework.NodeInfo) (string, error) {
+func (p *predicateManagerImpl) PreFilter(pod *v1.Pod, allocate bool) (map[string]*si.Empty, *framework.CycleState, error) {
 	ctx := context.Background()
-	state := framework.NewCycleState()
-	return p.podFitsNode(ctx, state, *p.reservationPreFilters, *p.reservationFilters, pod, node)
-}
+	cycleState := framework.NewCycleState()
 
-func (p *predicateManagerImpl) predicatesAllocate(pod *v1.Pod, node *framework.NodeInfo) (string, error) {
-	ctx := context.Background()
-	state := framework.NewCycleState()
-	return p.podFitsNode(ctx, state, *p.allocationPreFilters, *p.allocationFilters, pod, node)
-}
-
-func (p *predicateManagerImpl) podFitsNode(ctx context.Context, state *framework.CycleState, preFilters []fwk.PreFilterPlugin, filters []fwk.FilterPlugin, pod *v1.Pod, node *framework.NodeInfo) (string, error) {
-	// Run "prefilter" plugins.
-	status, plugin, skip := p.runPreFilterPlugins(ctx, state, preFilters, pod, node)
+	var status *fwk.Status
+	var feasibleNodes map[string]*si.Empty
+	if allocate {
+		status, feasibleNodes = p.runPreFilterPlugins(ctx, cycleState, *p.allocationPreFilters, pod)
+	} else {
+		status, feasibleNodes = p.runPreFilterPlugins(ctx, cycleState, *p.reservationPreFilters, pod)
+	}
 	if !status.IsSuccess() && !status.IsSkip() {
-		return plugin, errors.New(status.Message())
+		return map[string]*si.Empty{}, nil, errors.New(status.Message())
 	}
-
-	// Run "filter" plugins on node
-	status, plugin = p.runFilterPlugins(ctx, filters, state, pod, node, skip)
-	if !status.IsSuccess() {
-		return plugin, errors.New(status.Message())
-	}
-	return "", nil
+	return feasibleNodes, cycleState, nil
 }
 
-func (p *predicateManagerImpl) runPreFilterPlugins(ctx context.Context, state *framework.CycleState, plugins []fwk.PreFilterPlugin, pod *v1.Pod, node *framework.NodeInfo) (*fwk.Status, string, map[string]bool) {
-	var mergedNodes *fwk.PreFilterResult
-	skip := make(map[string]bool)
+func (p *predicateManagerImpl) runPreFilterPlugins(ctx context.Context, cycleState *framework.CycleState, plugins []fwk.PreFilterPlugin, pod *v1.Pod) (*fwk.Status, map[string]*si.Empty) {
+	skipPlugins := sets.New[string]()
+	feasibleNodes := make(map[string]*si.Empty)
 	allNodes, err := p.sharedLister.NodeInfos().List()
 	if err != nil {
 		log.Log(log.ShimPredicates).Error("failed to list nodes",
 			zap.Error(err))
-		return fwk.AsStatus(err), "", skip
+		return fwk.AsStatus(err), feasibleNodes
 	}
+	mergedPreFilterResults := &fwk.PreFilterResult{}
 	for _, pl := range plugins {
 		plugin := pl.Name()
-		nodes, status := p.runPreFilterPlugin(ctx, pl, state, pod, allNodes)
+		nodes, status := pl.PreFilter(ctx, cycleState, pod, allNodes)
 		if status.IsSkip() {
-			skip[plugin] = true
-		} else if !status.IsSuccess() {
-			if status.IsRejected() {
-				return status, "", skip
-			}
+			skipPlugins.Insert(plugin)
+			continue
+		}
+		if status.IsRejected() {
+			return status, map[string]*si.Empty{}
+		}
+		if !status.IsSuccess() {
 			err := errors.New(status.Message())
 			log.Log(log.ShimPredicates).Error("failed running PreFilter plugin",
 				zap.String("pluginName", plugin),
 				zap.String("pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)),
 				zap.Error(err))
-			return fwk.AsStatus(errors.Join(fmt.Errorf("running PreFilter plugin %q: ", plugin), err)), plugin, skip
+			return fwk.AsStatus(fmt.Errorf("PreFilter plugin %q failed", plugin)), map[string]*si.Empty{}
 		}
-		// Merge is nil safe and returns a new PreFilterResult result if mergedNodes was nil
-		mergedNodes = mergedNodes.Merge(nodes)
-		if !mergedNodes.AllNodes() && !mergedNodes.NodeNames.Has(node.Node().Name) {
-			return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, "node not eligible"), plugin, skip
+		mergedPreFilterResults = mergedPreFilterResults.Merge(nodes)
+	}
+	if mergedPreFilterResults != nil {
+		for n := range mergedPreFilterResults.NodeNames {
+			feasibleNodes[n] = &si.Empty{}
 		}
 	}
-
-	return nil, "", skip
+	if skipPlugins.Len() > 0 {
+		cycleState.SetSkipFilterPlugins(skipPlugins)
+	}
+	return nil, feasibleNodes
 }
 
-func (p *predicateManagerImpl) runPreFilterPlugin(ctx context.Context, pl fwk.PreFilterPlugin, state *framework.CycleState, pod *v1.Pod, allNodes []fwk.NodeInfo) (*fwk.PreFilterResult, *fwk.Status) {
-	return pl.PreFilter(ctx, state, pod, allNodes)
+func (p *predicateManagerImpl) Filter(pod *v1.Pod, node *framework.NodeInfo, cycleState *framework.CycleState, allocate bool) error {
+	ctx := context.Background()
+
+	var status *fwk.Status
+	if allocate {
+		status = p.runFilterPlugins(ctx, *p.allocationFilters, cycleState, pod, node)
+	} else {
+		status = p.runFilterPlugins(ctx, *p.reservationFilters, cycleState, pod, node)
+	}
+	if !status.IsSuccess() {
+		return errors.New(status.Message())
+	}
+	return nil
 }
 
-func (p *predicateManagerImpl) runFilterPlugins(ctx context.Context, plugins []fwk.FilterPlugin, state *framework.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo, skip map[string]bool) (*fwk.Status, string) {
+func (p *predicateManagerImpl) runFilterPlugins(ctx context.Context, plugins []fwk.FilterPlugin, cycleState *framework.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) *fwk.Status {
+	skipPlugins := cycleState.GetSkipFilterPlugins()
 	for _, pl := range plugins {
 		plugin := pl.Name()
+
 		// skip plugin if prefilter returned skip
-		if skip[plugin] {
+		if skipPlugins.Has(plugin) {
 			continue
 		}
-		status := p.runFilterPlugin(ctx, pl, state, pod, nodeInfo)
+		status := pl.Filter(ctx, cycleState, pod, nodeInfo)
 		if !status.IsSuccess() {
 			if !status.IsRejected() {
 				// Filter plugins are not supposed to return any status other than
 				// Success or Unschedulable.
-				status = fwk.NewStatus(fwk.Error, fmt.Sprintf("running %q filter plugin for pod %q: %v", plugin, pod.Name, status.Message()))
 				log.Log(log.ShimPredicates).Error("failed running Filter plugin",
 					zap.String("pluginName", plugin),
 					zap.String("pod", fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)),
 					zap.String("message", status.Message()))
-				return status, plugin
+				status = fwk.NewStatus(fwk.Error, fmt.Sprintf("Filter plugin %q failed", plugin))
+				return status
 			}
-			return status, plugin
+			return status
 		}
 	}
-	return fwk.NewStatus(fwk.Success), ""
-}
-
-func (p *predicateManagerImpl) runFilterPlugin(ctx context.Context, pl fwk.FilterPlugin, state *framework.CycleState, pod *v1.Pod, nodeInfo fwk.NodeInfo) *fwk.Status {
-	return pl.Filter(ctx, state, pod, nodeInfo)
+	return fwk.NewStatus(fwk.Success)
 }
 
 // EnableOptionalKubernetesFeatureGates ensures that any optional Kubernetes feature gates that YuniKorn supports are
@@ -301,9 +309,13 @@ func EnableOptionalKubernetesFeatureGates() {
 	if err := feature.DefaultMutableFeatureGate.Set(fmt.Sprintf("%s=true", features.InPlacePodVerticalScaling)); err != nil {
 		log.Log(log.ShimPredicates).Fatal("Unable to set InPlacePodVerticalScaling feature gate", zap.Error(err))
 	}
+	log.Log(log.ShimPredicates).Debug("Enabling InterPodAffinityHostnameFastPath feature gate")
+	if err := feature.DefaultMutableFeatureGate.Set(fmt.Sprintf("%s=true", features.InterPodAffinityHostnameFastPath)); err != nil {
+		log.Log(log.ShimPredicates).Fatal("Unable to set InterPodAffinityHostnameFastPath feature gate", zap.Error(err))
+	}
 }
 
-func NewPredicateManager(handle fwk.Handle) PredicateManager {
+func NewPredicateManager(handle fwk.Handle, registry fwruntime.Registry, config *apiConfig.KubeSchedulerConfiguration) PredicateManager {
 	/*
 		Default K8S plugins as of 1.32 that implement PreFilter:
 			NodeAffinity
@@ -371,51 +383,59 @@ func NewPredicateManager(handle fwk.Handle) PredicateManager {
 	allocationFilters := map[string]bool{
 		"*": true,
 	}
-
-	return newPredicateManagerInternal(handle, reservationPreFilters, allocationPreFilters, reservationFilters, allocationFilters)
+	rp := map[string]bool{
+		names.DynamicResources: true,
+	}
+	pbp := map[string]bool{
+		names.DynamicResources: true,
+	}
+	return newPredicateManagerInternal(handle, registry, config, reservationPreFilters, allocationPreFilters, reservationFilters, allocationFilters, rp, pbp)
 }
 
 func newPredicateManagerInternal(
 	handle fwk.Handle,
+	registry fwruntime.Registry,
+	config *apiConfig.KubeSchedulerConfiguration,
 	reservationPreFilters map[string]bool,
 	allocationPreFilters map[string]bool,
 	reservationFilters map[string]bool,
-	allocationFilters map[string]bool) *predicateManagerImpl {
+	allocationFilters map[string]bool,
+	reservePluginsMap map[string]bool,
+	preBindPluginsMap map[string]bool) *predicateManagerImpl {
 	// ensure K8s scheduler metrics have been initialized in YK standalone mode to avoid SIGSEGV
 	if metrics.Goroutines == nil {
 		metrics.InitMetrics()
 	}
-
-	pluginRegistry := plugins.NewInTreeRegistry()
-
-	cfg, err := defaultConfig() // latest.Default()
-	if err != nil {
-		log.Log(log.ShimPredicates).Fatal("Unable to get default predicate config", zap.Error(err))
-	}
-
-	profile := cfg.Profiles[0] // first profile is default
+	profile := config.Profiles[0] // first profile is default
 	registeredPlugins := profile.Plugins
 	createdPlugins := make([]fwk.Plugin, 0)
 
 	// As of SchedulerConfiguration v1, all plugins implement MultiPoint, therefore we need to instantiate each one and
 	// check to see what interfaces it implements dynamically
-	createPlugins(handle, pluginRegistry, &registeredPlugins.MultiPoint, &createdPlugins)
+	createPlugins(handle, registry, &registeredPlugins.MultiPoint, &createdPlugins)
 
 	resPre := make([]fwk.Plugin, 0)
 	allocPre := make([]fwk.Plugin, 0)
 	resFilt := make([]fwk.Plugin, 0)
 	allocFilt := make([]fwk.Plugin, 0)
 
+	reserve := make([]fwk.Plugin, 0)
+	preBind := make([]fwk.Plugin, 0)
+
 	addPlugins("PreFilter", createdPlugins, &resPre, reservationPreFilters)
 	addPlugins("PreFilter", createdPlugins, &allocPre, allocationPreFilters)
 	addPlugins("Filter", createdPlugins, &resFilt, reservationFilters)
 	addPlugins("Filter", createdPlugins, &allocFilt, allocationFilters)
+	addPlugins("Reserve", createdPlugins, &reserve, reservePluginsMap)
+	addPlugins("PreBind", createdPlugins, &preBind, preBindPluginsMap)
 
 	pm := &predicateManagerImpl{
 		reservationPreFilters: preFilterPlugins(resPre),
 		allocationPreFilters:  preFilterPlugins(allocPre),
 		reservationFilters:    filterPlugins(resFilt),
 		allocationFilters:     filterPlugins(allocFilt),
+		reservePlugins:        reservePlugins(reserve),
+		preBindPlugins:        preBindPlugins(preBind),
 		klogger:               klog.NewKlogr(),
 		sharedLister:          handle.SnapshotSharedLister(),
 	}
@@ -445,7 +465,29 @@ func filterPlugins(plugins []fwk.Plugin) *[]fwk.FilterPlugin {
 	return &result
 }
 
-func defaultConfig() (*apiConfig.KubeSchedulerConfiguration, error) {
+func reservePlugins(plugins []fwk.Plugin) *[]fwk.ReservePlugin {
+	result := make([]fwk.ReservePlugin, 0)
+	for _, plugin := range plugins {
+		reserve, ok := plugin.(fwk.ReservePlugin)
+		if ok {
+			result = append(result, reserve)
+		}
+	}
+	return &result
+}
+
+func preBindPlugins(plugins []fwk.Plugin) *[]fwk.PreBindPlugin {
+	result := make([]fwk.PreBindPlugin, 0)
+	for _, plugin := range plugins {
+		preBind, ok := plugin.(fwk.PreBindPlugin)
+		if ok {
+			result = append(result, preBind)
+		}
+	}
+	return &result
+}
+
+func DefaultConfig() (*apiConfig.KubeSchedulerConfiguration, error) {
 	versionedCfg := schedConfig.KubeSchedulerConfiguration{}
 	versionedCfg.DebuggingConfiguration = *v1alpha1.NewRecommendedDebuggingConfiguration()
 

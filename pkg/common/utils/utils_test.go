@@ -1113,42 +1113,56 @@ func TestGetTaskGroupFromPodSpec(t *testing.T) {
 }
 
 func TestGetPlaceholderFlagFromPodSpec(t *testing.T) {
-	testCases := []struct {
-		description             string
-		pod                     *v1.Pod
-		expectedPlaceholderFlag bool
+	controller := true
+	nonController := false
+	tests := []struct {
+		name   string
+		flag   string
+		group  string
+		owners []metav1.OwnerReference
+		want   bool
 	}{
-		{"Setting by annotation", &v1.Pod{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       "Pod",
-				APIVersion: "v1",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "pod-01",
-				UID:  "UID-01",
-				Annotations: map[string]string{
-					constants.AnnotationPlaceholderFlag: "true",
-				},
-			},
-		}, true},
-		{"Pod without placeholder annotation", &v1.Pod{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       "Pod",
-				APIVersion: "v1",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "pod-01",
-				UID:  "UID-01",
-			},
-		}, false},
+		{"valid", "true", "group", []metav1.OwnerReference{{Kind: "Pod", Controller: &nonController}}, true},
+		{"controller omitted", "true", "group", []metav1.OwnerReference{{Kind: "Pod"}}, false},
+		{"missing flag", "", "group", []metav1.OwnerReference{{Kind: "Pod", Controller: &nonController}}, false},
+		{"false flag", "false", "group", []metav1.OwnerReference{{Kind: "Pod", Controller: &nonController}}, false},
+		{"invalid flag", "invalid", "group", []metav1.OwnerReference{{Kind: "Pod", Controller: &nonController}}, false},
+		{"missing task group", "true", "", []metav1.OwnerReference{{Kind: "Pod", Controller: &nonController}}, false},
+		{"missing owner", "true", "group", nil, false},
+		{"multiple owners", "true", "group", []metav1.OwnerReference{{Kind: "Pod", Controller: &nonController}, {Kind: "Pod", Controller: &nonController}}, false},
+		{"non pod owner", "true", "group", []metav1.OwnerReference{{Kind: "ReplicaSet", Controller: &nonController}}, false},
+		{"controller owner", "true", "group", []metav1.OwnerReference{{Kind: "Pod", Controller: &controller}}, false},
 	}
-
-	for _, tc := range testCases {
-		t.Run(tc.description, func(t *testing.T) {
-			placeHolderFlag := GetPlaceholderFlagFromPodSpec(tc.pod)
-			assert.Equal(t, placeHolderFlag, tc.expectedPlaceholderFlag)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					constants.AnnotationPlaceholderFlag: tt.flag,
+					constants.AnnotationTaskGroupName:   tt.group,
+					constants.AnnotationTaskGroups:      "[]",
+				},
+				OwnerReferences: tt.owners,
+			}}
+			original := pod.DeepCopy()
+			assert.Equal(t, GetPlaceholderFlagFromPodSpec(pod), tt.want)
+			assert.DeepEqual(t, pod, original)
 		})
 	}
+}
+
+func TestGetPlaceholderFlagWithGangSchedulingDisabled(t *testing.T) {
+	nonController := false
+	previous := conf.GetSchedulerConf().DisableGangScheduling
+	conf.GetSchedulerConf().DisableGangScheduling = true
+	t.Cleanup(func() { conf.GetSchedulerConf().DisableGangScheduling = previous })
+	pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Annotations: map[string]string{
+			constants.AnnotationPlaceholderFlag: "true",
+			constants.AnnotationTaskGroupName:   "group",
+		},
+		OwnerReferences: []metav1.OwnerReference{{Kind: "Pod", Controller: &nonController}},
+	}}
+	assert.Equal(t, GetPlaceholderFlagFromPodSpec(pod), false)
 }
 
 func TestGetCoreSchedulerConfigFromConfigMap(t *testing.T) {
@@ -1263,4 +1277,48 @@ func TestWaitForCondition(t *testing.T) {
 			assert.Equal(t, get.Error(), test.output.Error())
 		}
 	}
+}
+
+func dummyGoroutineWorker(stop chan struct{}) {
+	<-stop
+}
+
+func TestCountGoroutines(t *testing.T) {
+	// Negative test: empty pattern should return 0
+	assert.Equal(t, CountGoroutines(""), 0, "empty pattern should return 0")
+
+	// Negative test: non-existent pattern should return 0
+	assert.Equal(t, CountGoroutines("nonExistentGoroutineWorker_XYZ"), 0, "non-existent pattern should return 0")
+
+	// 0-1-N concurrency boundary test: 0 -> 3 -> 2 -> 0
+	assert.Equal(t, CountGoroutines("dummyGoroutineWorker"), 0)
+
+	stop1 := make(chan struct{})
+	stop2 := make(chan struct{})
+	stop3 := make(chan struct{})
+
+	go dummyGoroutineWorker(stop1)
+	go dummyGoroutineWorker(stop2)
+	go dummyGoroutineWorker(stop3)
+
+	// Verify count transitions from 0 to 3
+	err := WaitForCondition(func() bool {
+		return CountGoroutines("dummyGoroutineWorker") == 3
+	}, 10*time.Millisecond, time.Second)
+	assert.NilError(t, err, "expected exactly 3 goroutines")
+
+	// Verify count decreases from 3 to 2 when one goroutine finishes
+	close(stop1)
+	err = WaitForCondition(func() bool {
+		return CountGoroutines("dummyGoroutineWorker") == 2
+	}, 10*time.Millisecond, time.Second)
+	assert.NilError(t, err, "expected count to decrease to 2")
+
+	// Verify count decreases from 2 to 0 when remaining goroutines finish
+	close(stop2)
+	close(stop3)
+	err = WaitForCondition(func() bool {
+		return CountGoroutines("dummyGoroutineWorker") == 0
+	}, 10*time.Millisecond, time.Second)
+	assert.NilError(t, err, "expected all goroutines to terminate")
 }
